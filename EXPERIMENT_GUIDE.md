@@ -124,20 +124,21 @@ python pipeline/ml_pipeline.py --n-trials 20 --n-seeds 5
 
 #### What the improved pipeline does
 
-The pipeline uses **repeated holdout evaluation** with **Optuna** instead of a
+The pipeline uses **nested stratified cross-validation** with **Optuna** instead of a
 single 70/30 split with grid search:
 
 | Component | Original | Improved |
 |-----------|----------|----------|
-| Evaluation | Single 70/30 split → 1 test result | 30 × independent 70/30 splits → **30 test results → mean ± std** |
-| HPO | GridSearchCV (fixed grid) | **Optuna TPE** (continuous log-space, 50 trials) |
-| SMOTE | Applied before inner CV (mild leakage) | **Inside each inner fold via ImbPipeline** (no leakage into test set) |
+| Evaluation | Single 70/30 split → 1 test result | **5-fold outer stratified CV → all 72 subjects evaluated as test → mean ± std** |
+| HPO | GridSearchCV (fixed grid) | **Optuna TPE** on inner stratified 5-fold CV (continuous log-space, 50 trials) |
+| SMOTE | Applied before inner CV (mild leakage) | **Inside each inner fold via ImbPipeline** (no leakage into outer test fold) |
+| Stratification | Single stratified split | **Every outer and inner fold is stratified** — class ratio preserved throughout |
 | SVM AUC | Could be < 0.5 from Platt inversion | **Auto-corrected inside Optuna and evaluation** |
 
-Each seed produces an independent stratified 70/30 train/test split.
-Optuna tunes hyperparameters on the training set using 5-fold inner CV.
-The best model is then retrained on the full training set and evaluated
-on the held-out 22-subject test set.  Results are averaged across all seeds.
+The outer loop splits all 72 subjects into 5 stratified folds (~14 test subjects
+each).  Every subject appears as a test subject exactly once.  The inner loop
+tunes hyperparameters on the outer training set (~58 subjects) using a further
+5-fold stratified split.  Class proportions are preserved in every fold.
 
 #### Anchor to thesis features (skip Boruta)
 
@@ -155,8 +156,9 @@ python pipeline/ml_pipeline.py \
 | `--features` | `gait_features_rich.csv` | Input feature CSV |
 | `--out` | `outputs/` | Output directory |
 | `--selected-features` | *(run Boruta)* | Skip Boruta; use these features |
-| `--n-trials` | `50` | Optuna trials per model per seed |
-| `--n-seeds` | `30` | Number of independent 70/30 holdout splits |
+| `--n-trials` | `50` | Optuna trials per model per outer fold |
+| `--n-outer` | `5` | Number of outer CV folds |
+| `--n-inner` | `5` | Number of inner CV folds for HPO |
 
 ### Step 4 — View Results
 
@@ -164,8 +166,8 @@ All outputs are saved in `outputs/`:
 
 | File | Description |
 |------|-------------|
-| `model_comparison_results.csv` | **mean ± std** of AUC, Accuracy, Sensitivity, Specificity, F1, Precision across all seeds |
-| `per_seed_results.csv` | Raw metrics for every individual (seed, model) combination |
+| `model_comparison_results.csv` | **mean ± std** of AUC, Accuracy, Sensitivity, Specificity, F1, Precision across all outer folds |
+| `per_fold_results.csv` | Raw metrics for every individual (fold, model) combination |
 | `statistical_test_results.csv` | p-values and test type for all retained features |
 | `plot_sig_features_boxplot.png` | Boxplots of significant features (ASD vs Non-ASD) |
 | `plot_rf_importance.png` | RF feature importance from the fold with the highest RF AUC |
@@ -202,11 +204,9 @@ reflecting genuine variability on this 72-subject dataset.
 
 ### Stochasticity and reproducibility
 
-All random operations are seeded by the seed index (0, 1, …, N−1).
-Each seed controls the train/test split, the inner CV fold assignment,
-the SMOTE sampling, and the Optuna study — so each seed's experiment
-is independently reproducible.  Results are fully reproducible across
-runs on the same machine and library version.
+The outer CV uses `random_state=42`.  Each inner CV uses `random_state=fold_idx`
+so every fold's hyperparameter search is independently seeded and reproducible.
+Results are fully reproducible across runs on the same machine and library version.
 
 ---
 
@@ -222,14 +222,14 @@ python pipeline/feature_extraction.py \
 # Verify against the ground-truth CSV
 python pipeline/feature_extraction.py --verify
 
-# ML pipeline — fast test run (5 seeds, 20 Optuna trials)
-python pipeline/ml_pipeline.py --n-trials 20 --n-seeds 5
+# ML pipeline — fast test run (5 outer folds, 3 inner folds, 20 Optuna trials)
+python pipeline/ml_pipeline.py --n-trials 20 --n-outer 5 --n-inner 3
 
 # ML pipeline with thesis features and full settings
 python pipeline/ml_pipeline.py \
     --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt \
                         LDP_cv TrunkY_max CoM_Y_min StepLength \
-    --n-trials 50 --n-seeds 30
+    --n-trials 50 --n-outer 5 --n-inner 5
 ```
 
 ---
