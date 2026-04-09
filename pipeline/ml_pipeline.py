@@ -409,7 +409,7 @@ def plot_cv_dotplot(cv_scores_dict, out_path):
 # 5. Main pipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main(features_csv, out_dir):
+def main(features_csv, out_dir, preselected_features=None):
     os.makedirs(out_dir, exist_ok=True)
     rng = 42
 
@@ -475,36 +475,48 @@ def main(features_csv, out_dir):
     print('\n' + '=' * 60)
     print('Step 5 – Boruta feature selection (max_iter=200)')
     print('=' * 60)
-    X_all = df[feat_cols].values
-    y_all = (df['Class'] == 'ASD').astype(int).values
 
-    selected_feats = []
-    if BORUTA_AVAILABLE:
-        # R's Boruta uses default randomForest (no depth limit, no class weight).
-        # Match those defaults here — max_depth=None, class_weight=None.
-        rf_boruta = RandomForestClassifier(
-            n_jobs=-1, random_state=rng)
-        boruta = BorutaPy(rf_boruta, n_estimators='auto',
-                          max_iter=200, random_state=rng, verbose=0)
-        try:
-            boruta.fit(X_all, y_all)
-            selected_feats = [feat_cols[i]
-                              for i, s in enumerate(boruta.support_) if s]
-            # Include tentative features (TentativeRoughFix equivalent)
-            tentative = [feat_cols[i]
-                         for i, s in enumerate(boruta.support_weak_) if s]
-            selected_feats = list(dict.fromkeys(selected_feats + tentative))
-            print(f'  Boruta confirmed: {len(selected_feats)} features')
-        except Exception as e:
-            print(f'  [WARN] Boruta failed: {e}')
-            selected_feats = []
+    if preselected_features:
+        # --selected-features supplied: skip Boruta entirely.
+        missing = [f for f in preselected_features if f not in feat_cols]
+        if missing:
+            print(f'  [WARN] These specified features are not in the dataset '
+                  f'(may have been removed by NZV/correlation): {missing}')
+        selected_feats = [f for f in preselected_features if f in feat_cols]
+        print(f'  Using pre-specified features ({len(selected_feats)}): '
+              f'{", ".join(selected_feats)}')
+        print(f'  (Boruta skipped — feature list supplied via --selected-features)')
     else:
-        print('  Boruta not available.')
+        X_all = df[feat_cols].values
+        y_all = (df['Class'] == 'ASD').astype(int).values
 
-    # Fallback: use statistically significant features
-    if not selected_feats:
-        print('  Falling back to statistically significant features.')
-        selected_feats = sig_feats if sig_feats else feat_cols
+        selected_feats = []
+        if BORUTA_AVAILABLE:
+            # R's Boruta uses default randomForest (no depth limit, no class weight).
+            # Match those defaults here — max_depth=None, class_weight=None.
+            rf_boruta = RandomForestClassifier(
+                n_jobs=-1, random_state=rng)
+            boruta = BorutaPy(rf_boruta, n_estimators='auto',
+                              max_iter=200, random_state=rng, verbose=0)
+            try:
+                boruta.fit(X_all, y_all)
+                selected_feats = [feat_cols[i]
+                                  for i, s in enumerate(boruta.support_) if s]
+                # Include tentative features (TentativeRoughFix equivalent)
+                tentative = [feat_cols[i]
+                             for i, s in enumerate(boruta.support_weak_) if s]
+                selected_feats = list(dict.fromkeys(selected_feats + tentative))
+                print(f'  Boruta confirmed: {len(selected_feats)} features')
+            except Exception as e:
+                print(f'  [WARN] Boruta failed: {e}')
+                selected_feats = []
+        else:
+            print('  Boruta not available.')
+
+        # Fallback: use statistically significant features
+        if not selected_feats:
+            print('  Falling back to statistically significant features.')
+            selected_feats = sig_feats if sig_feats else feat_cols
 
     print(f'  Selected ({len(selected_feats)}): {", ".join(selected_feats)}')
 
@@ -731,5 +743,18 @@ if __name__ == '__main__':
         '--out',
         default=os.path.join(root, 'outputs'),
         help='Output directory (default: outputs/)')
+    parser.add_argument(
+        '--selected-features',
+        nargs='+',
+        metavar='FEATURE',
+        default=None,
+        help=(
+            'Skip Boruta and use this exact feature list instead.  '
+            'Pass the names confirmed by the thesis to anchor the pipeline '
+            'to the published results.  Example: '
+            '--selected-features LHip_min RKnee_skew RAnkle_skew '
+            'LAnkle_kurt LDP_cv TrunkY_max CoM_Y_min StepLength'
+        ))
     args = parser.parse_args()
-    main(args.features, args.out)
+    main(args.features, args.out,
+         preselected_features=args.selected_features)

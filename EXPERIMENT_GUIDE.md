@@ -121,6 +121,30 @@ saves all outputs to the `outputs/` directory.
 The pipeline takes several minutes, mainly due to Boruta (200 iterations) and
 the SVM/XGBoost grid searches.
 
+#### Why Python results differ from the thesis (R)
+
+R and Python use completely different random number generators.  Setting
+`set.seed(42)` in R and `random_state=42` in Python produces entirely different
+random sequences — they are not comparable.  Every stochastic step diverges:
+Boruta, the train/test split, SMOTE, CV fold assignments, and model training.
+
+**To anchor the pipeline to the thesis features**, pass the 8 Boruta-confirmed
+features from the thesis directly and skip the stochastic Boruta step:
+
+```bash
+python pipeline/ml_pipeline.py \
+  --selected-features \
+    LHip_min RKnee_skew RAnkle_skew LAnkle_kurt \
+    LDP_cv TrunkY_max CoM_Y_min StepLength
+```
+
+With `--selected-features`, Boruta is skipped entirely and these features go
+straight to the train/test split.  The train/test split and SMOTE will still
+differ from R (inherent implementation difference), so metrics will not be
+identical to the thesis, but the feature space will match.
+
+To get exact thesis results, run `thesis.R` directly in R.
+
 ### Step 4 — View Results
 
 All outputs are saved in `outputs/`:
