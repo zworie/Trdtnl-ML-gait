@@ -19,7 +19,8 @@ Steps:
   6.  Boruta feature selection            (fallback: use significant features)
   7.  Outer N-fold stratified CV loop
   8.  For each outer fold: inner M-fold stratified Optuna HPO on training set
-  9.  StandardScaler + SMOTE inside ImbPipeline (no leakage into outer test fold)
+  9.  StandardScaler inside Pipeline; class imbalance handled via class_weight='balanced'
+      (LR / SVM / RF) and scale_pos_weight (XGB); no synthetic over-sampling
   10. Evaluate on outer test fold: AUC, Accuracy, Sensitivity, Specificity, F1, Precision
   11. Aggregate metrics: mean +/- std over N outer folds
   12. Plots: ROC (mean + per-fold), bar chart, RF importance, AUC box plots
@@ -30,8 +31,9 @@ Faithfulness notes
 - Boruta and statistical tests are run on the FULL dataset (same as R code),
   before the outer CV loop.  This is a data-leakage issue documented in
   FINDINGS.md but replicated here for reproducibility.
-- SMOTE runs inside each inner fold (ImbPipeline) — prevents synthetic sample
-  leakage into the outer test fold.
+- Class imbalance is handled via class_weight='balanced' (LR/SVM/RF) and
+  scale_pos_weight = n_neg/n_pos per outer fold (XGB).  No synthetic samples
+  are generated, so there is no SMOTE leakage risk.
 - All random seeds derive from the outer fold index; Optuna studies seeded
   as fold_idx so each fold's search is independently reproducible.
 - XGBoost is an extension present in thesis.R but absent from published
@@ -57,8 +59,6 @@ import pandas as pd
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.over_sampling import SMOTE
 from scipy.stats import mannwhitneyu, shapiro, ttest_ind
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import RandomForestClassifier
@@ -69,6 +69,7 @@ from sklearn.model_selection import (
     StratifiedKFold,
     cross_val_score,
 )
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
@@ -312,19 +313,25 @@ def suggest_params(trial, model_key):
 
 def build_pipe(model_key, params, rng=42):
     """
-    Build an ImbPipeline with StandardScaler -> SMOTE -> model.
+    Build a Pipeline with StandardScaler -> model.
+    Class imbalance is handled natively:
+      LR / SVM / RF: class_weight='balanced'
+      XGB:           scale_pos_weight = n_neg/n_pos (pass in params)
+      LDA:           uses estimated class priors by default
     params keys are raw model parameter names (no 'model__' prefix).
     """
     if model_key == 'LR':
         estimator = LogisticRegression(
             penalty='elasticnet', solver='saga',
             max_iter=2000, random_state=rng,
+            class_weight='balanced',
             C=params.get('C', 1.0),
             l1_ratio=params.get('l1_ratio', 0.5),
         )
     elif model_key == 'RF':
         estimator = RandomForestClassifier(
             random_state=rng, n_jobs=-1,
+            class_weight='balanced',
             n_estimators=params.get('n_estimators', 200),
             max_features=params.get('max_features', 'sqrt'),
             min_samples_leaf=params.get('min_samples_leaf', 1),
@@ -333,12 +340,13 @@ def build_pipe(model_key, params, rng=42):
     elif model_key == 'SVM':
         estimator = SVC(
             kernel='rbf', probability=True, random_state=rng,
+            class_weight='balanced',
             C=params.get('C', 1.0),
             gamma=params.get('gamma', 'scale'),
         )
     elif model_key == 'LDA':
         # Ledoit-Wolf automatic shrinkage — no hyperparameters to tune.
-        # Works well for small-sample, low-feature-count datasets.
+        # LDA uses estimated class priors, which accounts for imbalance.
         estimator = LinearDiscriminantAnalysis(solver='lsqr', shrinkage='auto')
     elif model_key == 'XGB':
         if not XGB_AVAILABLE:
@@ -346,6 +354,8 @@ def build_pipe(model_key, params, rng=42):
         estimator = XGBClassifier(
             eval_metric='logloss', verbosity=0,
             random_state=rng, n_jobs=-1,
+            # scale_pos_weight = n_neg/n_pos balances XGBoost's loss weighting
+            scale_pos_weight=params.get('scale_pos_weight', 1.0),
             n_estimators=params.get('n_estimators', 100),
             max_depth=params.get('max_depth', 3),
             learning_rate=params.get('learning_rate', 0.1),
@@ -357,9 +367,8 @@ def build_pipe(model_key, params, rng=42):
     else:
         raise ValueError(f'Unknown model_key: {model_key}')
 
-    pipe = ImbPipeline([
+    pipe = Pipeline([
         ('scaler', StandardScaler()),
-        ('smote',  SMOTE(random_state=rng, sampling_strategy=1.0)),
         ('model',  estimator),
     ])
     return pipe
@@ -367,8 +376,14 @@ def build_pipe(model_key, params, rng=42):
 
 def make_objective(model_key, X_tr, y_tr, inner_cv, rng):
     """Return an Optuna objective function for the given model and fold data."""
+    # Compute class imbalance ratio once (outer training fold); used by XGB.
+    _pos_weight = (float(np.sum(y_tr == 0)) / float(np.sum(y_tr == 1))
+                   if model_key == 'XGB' and np.sum(y_tr == 1) > 0 else 1.0)
+
     def objective(trial):
         params = suggest_params(trial, model_key)
+        if model_key == 'XGB':
+            params['scale_pos_weight'] = _pos_weight
         pipe   = build_pipe(model_key, params, rng)
         # n_jobs=1: avoids joblib pool corruption when called from Optuna's loop.
         # error_score=0.5: failed folds return 0.5 (random chance) rather than NaN.
@@ -741,6 +756,9 @@ def main(features_csv, out_dir,
                 final_params = best_params.copy()
                 if key == 'RF':
                     final_params['n_estimators'] = 1000
+                if key == 'XGB' and np.sum(y_tr == 1) > 0:
+                    final_params['scale_pos_weight'] = (
+                        float(np.sum(y_tr == 0)) / float(np.sum(y_tr == 1)))
                 final_pipe = build_pipe(key, final_params, fold_idx)
                 final_pipe.fit(X_tr, y_tr)
 

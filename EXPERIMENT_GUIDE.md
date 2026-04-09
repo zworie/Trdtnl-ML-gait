@@ -59,7 +59,7 @@ You should see `(venv)` at the start of your prompt once activated.
 pip install -r requirements.txt
 ```
 
-This installs: numpy, pandas, scipy, scikit-learn, imbalanced-learn, boruta, xgboost, optuna, matplotlib, seaborn.
+This installs: numpy, pandas, scipy, scikit-learn, boruta, xgboost, optuna, matplotlib, seaborn.
 
 ---
 
@@ -134,7 +134,7 @@ python pipeline/ml_pipeline.py --n-trials 10 --n-outer 3 --n-inner 3
 | HPO — RF | GridSearchCV | **Optuna TPE** (3 continuous params, 50 trials) |
 | HPO — XGBoost | GridSearchCV | **Optuna TPE** (7 continuous params, 50 trials) |
 | HPO — LDA | — | **None** — Ledoit-Wolf shrinkage is fully automatic |
-| SMOTE | Applied before CV (mild leakage) | **Inside each inner fold via ImbPipeline** — never touches the outer test fold |
+| Class imbalance | SMOTE applied before CV (mild leakage) | **`class_weight='balanced'`** (LR/SVM/RF) and **`scale_pos_weight`** (XGB) — no synthetic samples, no leakage risk |
 | SVM AUC | Could be < 0.5 from Platt inversion | **Auto-corrected** in both HPO scoring and evaluation |
 
 #### Models
