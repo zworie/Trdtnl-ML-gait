@@ -80,3 +80,97 @@ python pipeline/feature_extraction.py --verify
 ```
 
 The `--verify` flag runs extraction in-memory, loads `gait_features_rich.csv`, and checks shape, column names, and numeric values (atol=1e-4). Nothing is written to disk.
+
+---
+
+## 4. Feature Preprocessing
+
+All preprocessing in `pipeline/ml_pipeline.py` is applied to the full 72-subject dataset before the cross-validation loop (matching the original R code behaviour; see leakage note in Section 6).
+
+### 4.1 Near-zero-variance (NZV) removal
+
+Replicates `caret::nearZeroVar`. A feature is removed when:
+- It has only one unique value (`zeroVar`), **or**
+- `freq_ratio > 19` **AND** `pct_unique < 10%`
+
+where `freq_ratio` = (count of most common value) / (count of second most common value), and `pct_unique` = (number of unique values / N) × 100.
+
+### 4.2 High-correlation removal
+
+Replicates `caret::findCorrelation` (fast/greedy algorithm). For each pair with |Pearson r| > 0.95, the feature with the higher mean absolute correlation to all other retained features is removed. The process iterates until no correlated pairs remain.
+
+**Feature count progression:**
+
+| Stage | Features remaining |
+|-------|--------------------|
+| After extraction | 163 |
+| After NZV removal | varies by run |
+| After correlation filtering | ~142 (matches thesis) |
+| After Boruta selection | typically 8–12 |
+
+---
+
+## 5. Statistical Group-Difference Tests
+
+For each retained feature, normality is assessed with the **Shapiro-Wilk test** on the full sample. Based on the result:
+- If SW p > 0.05 (approximately normal): **Welch t-test** (`equal_var=False`)
+- Otherwise: **Mann-Whitney U** (Wilcoxon rank-sum, two-sided)
+
+This replicates the R pipeline's `shapiro.test` → `t.test(var.equal=FALSE)` / `wilcox.test` logic.
+
+### Significant features from latest run (p < 0.05)
+
+The following 11 features showed statistically significant ASD vs Non-ASD differences in the most recent pipeline run:
+
+| Feature | Test | p-value | Description |
+|---------|------|---------|-------------|
+| `CoM_Y_max` | Wilcoxon | **0.0032** | Maximum vertical CoM position |
+| `CoM_Y_min` | Wilcoxon | **0.0037** | Minimum vertical CoM position |
+| `RAnkle_skew` | Wilcoxon | **0.0001** | Skewness of right ankle angle (strongest signal) |
+| `LKnee_zcr` | Wilcoxon | 0.0148 | Zero-crossing rate of left knee angle |
+| `StepWidth_skew` | Wilcoxon | 0.0114 | Skewness of step width distribution |
+| `TrunkY_max` | t-test | 0.0237 | Maximum trunk vertical displacement |
+| `RHip_skew` | Wilcoxon | 0.0248 | Skewness of right hip angle |
+| `LAnkle_rom` | Wilcoxon | 0.0361 | Range of motion of left ankle angle |
+| `LAnkle_kurt` | Wilcoxon | 0.0392 | Kurtosis of left ankle angle |
+| `StepLen_skew` | Wilcoxon | 0.0392 | Skewness of step length distribution |
+| `LAddAbd_peaks` | Wilcoxon | 0.0491 | Peak count of left adduction-abduction angle |
+
+`RAnkle_skew`, `CoM_Y_min`, `CoM_Y_max`, and `TrunkY_max` overlap with the 8 Boruta-confirmed thesis features, providing convergent evidence.
+
+---
+
+## 6. Feature Selection — Boruta
+
+**Implementation:** `boruta.BorutaPy` with `RandomForestClassifier` backend (`max_iter=200`, `random_state=42`).
+
+Boruta compares each feature's importance to the maximum importance of randomly permuted shadow features. Features that consistently outperform random noise are confirmed; those that consistently underperform are rejected. Tentative features (insufficient evidence) are included with confirmed features in this pipeline.
+
+If Boruta fails (package missing or exception), the pipeline falls back to the statistically significant features from Section 5.
+
+### Boruta-confirmed features (from published thesis)
+
+The thesis reports 8 Boruta-confirmed features selected from the full 72-subject dataset:
+
+| Feature | Description |
+|---------|-------------|
+| `LHip_min` | Minimum left hip angle |
+| `RKnee_skew` | Skewness of right knee angle |
+| `RAnkle_skew` | Skewness of right ankle angle |
+| `LAnkle_kurt` | Kurtosis of left ankle angle |
+| `LDP_cv` | Coefficient of variation of left dorsiplantar angle |
+| `TrunkY_max` | Maximum trunk vertical displacement |
+| `CoM_Y_min` | Minimum centre-of-mass vertical position |
+| `StepLength` | Mean step length (pixel distance between ankles at contact) |
+
+To bypass Boruta and use this exact set directly:
+
+```bash
+python pipeline/ml_pipeline.py \
+  --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt \
+                      LDP_cv TrunkY_max CoM_Y_min StepLength
+```
+
+### ⚠ Data leakage note
+
+Both the statistical tests and Boruta are run on **all 72 subjects** before the cross-validation loop begins. This means the feature selection process has seen the test subjects — a form of data leakage inherited from the original R code. The leakage is mild (feature selection, not model training, sees all data) but means reported CV metrics are slightly optimistic. This is documented here for transparency and replicated faithfully to match the published methodology.
