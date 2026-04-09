@@ -103,9 +103,12 @@ def near_zero_var(df, freq_cut=19.0, unique_cut=10.0):
     Replicate caret::nearZeroVar.
 
     A feature is near-zero-variance when:
-      freq_ratio  = (count of most common value) / (count of 2nd most common) > freq_cut
+      zeroVar  (only one unique value)
       OR
-      pct_unique  = (# unique values / # observations) * 100 < unique_cut
+      (freq_ratio > freq_cut  AND  pct_unique < unique_cut)
+
+    This matches the caret source:
+      which(zeroVar | (freqRatio > freqCut & percentUnique < uniqueCut))
 
     Returns list of column names to remove.
     """
@@ -113,22 +116,26 @@ def near_zero_var(df, freq_cut=19.0, unique_cut=10.0):
     n = len(df)
     for col in df.columns:
         vc = df[col].value_counts()
-        if len(vc) == 0:
+        if len(vc) <= 1:
+            # zero variance — always remove
             to_remove.append(col)
             continue
-        freq_ratio = vc.iloc[0] / vc.iloc[1] if len(vc) >= 2 else np.inf
+        freq_ratio = vc.iloc[0] / vc.iloc[1]
         pct_unique = (len(vc) / n) * 100
-        if freq_ratio > freq_cut or pct_unique < unique_cut:
+        if freq_ratio > freq_cut and pct_unique < unique_cut:
             to_remove.append(col)
     return to_remove
 
 
 def find_correlation(cor_mat, cutoff=0.95):
     """
-    Replicate caret::findCorrelation (greedy algorithm).
+    Replicate caret::findCorrelation_fast (used when ncol >= 100).
 
-    For each pair of features with |correlation| > cutoff, remove the one
-    with the higher mean absolute correlation to all other features.
+    Iterates through column pairs in index order (i < j).  For each pair
+    with |correlation| > cutoff, the variable with the higher mean absolute
+    correlation to all remaining variables is marked for deletion.  When
+    variable i is deleted, the inner loop breaks (matches R's ``break``).
+
     Returns list of column names to remove.
     """
     cols = list(cor_mat.columns)
@@ -136,20 +143,26 @@ def find_correlation(cor_mat, cutoff=0.95):
     abs_cor = cor_mat.abs().values.copy()
     np.fill_diagonal(abs_cor, 0)
 
-    to_remove = set()
-    for _ in range(n * n):          # upper bound on iterations
-        # find the pair with the highest absolute correlation
-        i, j = np.unravel_index(np.argmax(abs_cor), abs_cor.shape)
-        if abs_cor[i, j] <= cutoff:
-            break
-        # remove the one with the higher mean absolute correlation to others
-        mean_i = abs_cor[i, :].mean()
-        mean_j = abs_cor[j, :].mean()
-        drop = i if mean_i >= mean_j else j
-        to_remove.add(cols[drop])
-        abs_cor[drop, :] = 0
-        abs_cor[:, drop] = 0
-    return list(to_remove)
+    deleted = [False] * n
+    for i in range(n - 1):
+        if deleted[i]:
+            continue
+        for j in range(i + 1, n):
+            if deleted[j]:
+                continue
+            if abs_cor[i, j] > cutoff:
+                mean_i = abs_cor[i, :].mean()
+                mean_j = abs_cor[j, :].mean()
+                if mean_i >= mean_j:
+                    deleted[i] = True
+                    abs_cor[i, :] = 0
+                    abs_cor[:, i] = 0
+                    break          # match R: stop checking j's for this i
+                else:
+                    deleted[j] = True
+                    abs_cor[j, :] = 0
+                    abs_cor[:, j] = 0
+    return [cols[k] for k in range(n) if deleted[k]]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -444,9 +457,10 @@ def main(features_csv, out_dir):
 
     selected_feats = []
     if BORUTA_AVAILABLE:
+        # R's Boruta uses default randomForest (no depth limit, no class weight).
+        # Match those defaults here — max_depth=None, class_weight=None.
         rf_boruta = RandomForestClassifier(
-            n_jobs=-1, class_weight='balanced',
-            max_depth=5, random_state=rng)
+            n_jobs=-1, random_state=rng)
         boruta = BorutaPy(rf_boruta, n_estimators='auto',
                           max_iter=200, random_state=rng, verbose=0)
         try:

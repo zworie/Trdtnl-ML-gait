@@ -151,3 +151,28 @@ From Table 3 / Figure 9 in the thesis:
 | Logistic Regression | — | — |
 
 SVM optimal hyperparameters (from GridSearchCV): C=0.01, sigma=1.
+
+---
+
+## 11. Expected Differences Between R and Python Results
+
+The Python pipeline (`pipeline/ml_pipeline.py`) replicates the R pipeline's logic
+as faithfully as possible, but exact numerical results will differ due to
+inherent implementation differences between R and Python packages:
+
+| Component | R | Python | Impact |
+|-----------|---|--------|--------|
+| **Train/test split** | `caret::createDataPartition` | `sklearn.model_selection.train_test_split` | Different stratified sampling algorithms produce different splits even with the same seed value. With only 72 subjects and a 22-subject test set, a few different subjects in test can move metrics substantially. |
+| **SMOTE** | `themis::step_smote` | `imblearn.over_sampling.SMOTE` | Different implementations of the SMOTE algorithm (nearest-neighbour search, synthetic sample generation). Training data differs. |
+| **Logistic Regression** | `glmnet` (coordinate descent) | `saga` solver (stochastic average gradient) | Different optimisation algorithms for the same objective function. May converge to different solutions. |
+| **SVM** | `kernlab::ksvm` | `libsvm` (via sklearn) | Different SVM implementations. `probability=True` in sklearn adds Platt scaling which can shift AUC slightly. |
+| **Random Forest** | R's `randomForest` package | sklearn's `RandomForestClassifier` | Different tree-building implementations. Feature importance values will differ. |
+| **Boruta** | R's `Boruta` package (uses `ranger`) | `boruta-py` (uses sklearn RF) | Different RF backends may rank features differently, potentially selecting a different final feature set. |
+| **CV fold assignments** | caret's internal CV splitter | `RepeatedStratifiedKFold` | Different fold assignments even with the same seed. |
+
+**Bottom line:** Metrics will be in the same ballpark but not identical.
+The relative ranking of models (SVM typically best) and the selected features
+should be broadly consistent. Exact AUC/F1 values may differ by 0.05–0.15
+depending on how the test set falls.
+
+To get identical results to the thesis, run the original `thesis.R` in R.
