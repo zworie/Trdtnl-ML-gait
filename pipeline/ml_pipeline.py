@@ -62,6 +62,7 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.over_sampling import SMOTE
 from scipy.stats import mannwhitneyu, shapiro, ttest_ind
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import make_scorer, roc_auc_score, roc_curve, confusion_matrix
@@ -98,11 +99,12 @@ MODEL_DISPLAY = {
     'LR':  'Logistic Regression (Elastic Net)',
     'RF':  'Random Forest',
     'SVM': 'SVM (RBF Kernel)',
+    'LDA': 'LDA (Ledoit-Wolf)',
     'XGB': 'XGBoost',
 }
 
 PALETTE      = {'ASD': '#D6604D', 'NonASD': '#4393C3'}
-MODEL_COLORS = ['#1B7837', '#2166AC', '#D6604D', '#762A83', '#E08214']
+MODEL_COLORS = ['#1B7837', '#2166AC', '#D6604D', '#762A83', '#E08214', '#8B4513']
 
 
 # =============================================================================
@@ -328,6 +330,10 @@ def build_pipe(model_key, params, rng=42):
             C=params.get('C', 1.0),
             gamma=params.get('gamma', 'scale'),
         )
+    elif model_key == 'LDA':
+        # Ledoit-Wolf automatic shrinkage — no hyperparameters to tune.
+        # Works well for small-sample, low-feature-count datasets.
+        estimator = LinearDiscriminantAnalysis(solver='lsqr', shrinkage='auto')
     elif model_key == 'XGB':
         if not XGB_AVAILABLE:
             raise RuntimeError('XGBoost not installed')
@@ -651,7 +657,7 @@ def main(features_csv, out_dir,
     y_all_sel = (df_sel['Class'] == 'ASD').astype(int).values
 
     # Determine which models to run
-    model_keys = ['LR', 'RF', 'SVM']
+    model_keys = ['LR', 'RF', 'SVM', 'LDA']
     if XGB_AVAILABLE:
         model_keys.append('XGB')
 
@@ -679,29 +685,36 @@ def main(features_csv, out_dir,
         fold_auc_parts = {}
 
         for key in model_keys:
-            sampler = optuna.samplers.TPESampler(seed=fold_idx)
-            study   = optuna.create_study(direction='maximize', sampler=sampler)
-            study.optimize(
-                make_objective(key, X_tr, y_tr, inner_cv, fold_idx),
-                n_trials=n_trials,
-                show_progress_bar=False,
-            )
-
-            completed = [t for t in study.trials
-                         if t.state == optuna.trial.TrialState.COMPLETE]
-            if not completed:
-                print(f'  [WARN] All {n_trials} trials failed for {key} '
-                      f'(fold {fold_idx}); using default params.')
-                best_params = {}
+            if key == 'LDA':
+                # LDA with Ledoit-Wolf shrinkage has no hyperparameters to tune.
+                # Fit directly on the outer training fold.
+                final_pipe   = build_pipe('LDA', {}, fold_idx)
+                final_pipe.fit(X_tr, y_tr)
+                best_params  = {}
             else:
-                best_params = study.best_params.copy()
+                sampler = optuna.samplers.TPESampler(seed=fold_idx)
+                study   = optuna.create_study(direction='maximize', sampler=sampler)
+                study.optimize(
+                    make_objective(key, X_tr, y_tr, inner_cv, fold_idx),
+                    n_trials=n_trials,
+                    show_progress_bar=False,
+                )
 
-            # Refit on full outer training fold; RF bumped to 1000 trees
-            final_params = best_params.copy()
-            if key == 'RF':
-                final_params['n_estimators'] = 1000
-            final_pipe = build_pipe(key, final_params, fold_idx)
-            final_pipe.fit(X_tr, y_tr)
+                completed = [t for t in study.trials
+                             if t.state == optuna.trial.TrialState.COMPLETE]
+                if not completed:
+                    print(f'  [WARN] All {n_trials} trials failed for {key} '
+                          f'(fold {fold_idx}); using default params.')
+                    best_params = {}
+                else:
+                    best_params = study.best_params.copy()
+
+                # Refit on full outer training fold; RF bumped to 1000 trees
+                final_params = best_params.copy()
+                if key == 'RF':
+                    final_params['n_estimators'] = 1000
+                final_pipe = build_pipe(key, final_params, fold_idx)
+                final_pipe.fit(X_tr, y_tr)
 
             # Evaluate on outer test fold
             metrics = eval_holdout(final_pipe, X_te, y_te)
