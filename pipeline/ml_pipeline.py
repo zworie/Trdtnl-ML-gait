@@ -67,6 +67,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import make_scorer, roc_auc_score, roc_curve, confusion_matrix
 from sklearn.model_selection import (
+    GridSearchCV,
     StratifiedKFold,
     cross_val_score,
 )
@@ -105,6 +106,19 @@ MODEL_DISPLAY = {
 
 PALETTE      = {'ASD': '#D6604D', 'NonASD': '#4393C3'}
 MODEL_COLORS = ['#1B7837', '#2166AC', '#D6604D', '#762A83', '#E08214', '#8B4513']
+
+# Grid search parameter grids for LR and SVM.
+# Keys use the 'model__' pipeline prefix so GridSearchCV can set them directly.
+PARAM_GRID = {
+    'LR': {
+        'model__C':        [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0],
+        'model__l1_ratio': [0.0, 0.25, 0.5, 0.75, 1.0],
+    },
+    'SVM': {
+        'model__C':     [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0],
+        'model__gamma': [1e-4, 1e-3, 1e-2, 1e-1, 1.0],
+    },
+}
 
 
 # =============================================================================
@@ -647,8 +661,8 @@ def main(features_csv, out_dir,
     # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
     print(f'Steps 6–11 – Nested CV  '
-          f'[outer: {n_outer}-fold stratified | '
-          f'inner: {n_inner}-fold stratified Optuna, {n_trials} trials/model]')
+          f'[outer: {n_outer}-fold | inner: {n_inner}-fold | '
+          f'GridSearch (LR/SVM) | Optuna {n_trials} trials (RF/XGB) | LDA: none]')
     print('=' * 60)
     print('  NOTE: Boruta ran on ALL data (acknowledged leakage; see FINDINGS.md)')
     print()
@@ -686,12 +700,30 @@ def main(features_csv, out_dir,
 
         for key in model_keys:
             if key == 'LDA':
-                # LDA with Ledoit-Wolf shrinkage has no hyperparameters to tune.
-                # Fit directly on the outer training fold.
-                final_pipe   = build_pipe('LDA', {}, fold_idx)
+                # No HPO — Ledoit-Wolf shrinkage is fully automatic.
+                final_pipe  = build_pipe('LDA', {}, fold_idx)
                 final_pipe.fit(X_tr, y_tr)
-                best_params  = {}
+                best_params = {}
+
+            elif key in ('LR', 'SVM'):
+                # GridSearchCV — efficient for 2-parameter grids.
+                # inner_cv is stratified, n_jobs=1 avoids pool issues inside fold loop.
+                # refit=True refits the best estimator on the full outer training fold.
+                base_pipe  = build_pipe(key, {}, fold_idx)
+                gs = GridSearchCV(
+                    base_pipe, PARAM_GRID[key],
+                    cv=inner_cv,
+                    scoring=corrected_auc_scorer,
+                    refit=True,
+                    n_jobs=1,
+                )
+                gs.fit(X_tr, y_tr)
+                final_pipe  = gs.best_estimator_
+                best_params = {k.replace('model__', ''): v
+                               for k, v in gs.best_params_.items()}
+
             else:
+                # Optuna TPE — efficient for higher-dimensional spaces (RF: 3, XGB: 7).
                 sampler = optuna.samplers.TPESampler(seed=fold_idx)
                 study   = optuna.create_study(direction='maximize', sampler=sampler)
                 study.optimize(
