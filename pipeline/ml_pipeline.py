@@ -97,11 +97,12 @@ except ImportError:
 # =============================================================================
 
 MODEL_DISPLAY = {
-    'LR':  'Logistic Regression (Elastic Net)',
-    'RF':  'Random Forest',
-    'SVM': 'SVM (RBF Kernel)',
-    'LDA': 'LDA (Ledoit-Wolf)',
-    'XGB': 'XGBoost',
+    'LR':       'Logistic Regression (Elastic Net)',
+    'RF':       'Random Forest',
+    'SVM':      'SVM (RBF Kernel)',
+    'LDA':      'LDA (Ledoit-Wolf)',
+    'XGB':      'XGBoost',
+    'Ensemble': 'Soft-Vote Ensemble',
 }
 
 PALETTE      = {'ASD': '#D6604D', 'NonASD': '#4393C3'}
@@ -398,17 +399,17 @@ def make_objective(model_key, X_tr, y_tr, inner_cv, rng):
 def eval_holdout(final_pipe, X_te, y_te):
     """
     Evaluate a fitted pipeline on the held-out test set.
-    Returns dict of metrics and (fpr, tpr) arrays for ROC plotting.
+    Returns dict of metrics, (fpr, tpr) arrays, and the AUC-corrected y_prob.
+    y_pred is derived from the corrected y_prob so metrics are consistent.
     """
-    y_prob = final_pipe.predict_proba(X_te)[:, 1]
-    y_pred = final_pipe.predict(X_te)
-
+    y_prob  = final_pipe.predict_proba(X_te)[:, 1]
     auc_val = roc_auc_score(y_te, y_prob)
     if auc_val < 0.5:
-        y_prob = 1.0 - y_prob
+        y_prob  = 1.0 - y_prob
         auc_val = 1.0 - auc_val
 
     fpr, tpr, _ = roc_curve(y_te, y_prob)
+    y_pred = (y_prob >= 0.5).astype(int)   # threshold on corrected probabilities
 
     cm = confusion_matrix(y_te, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
@@ -425,6 +426,7 @@ def eval_holdout(final_pipe, X_te, y_te):
         'sensitivity': sensitivity, 'specificity': specificity,
         'precision': precision, 'f1': f1,
         'fpr': fpr, 'tpr': tpr,
+        'y_prob': y_prob,   # corrected; used by soft-vote ensemble
     }
 
 
@@ -670,18 +672,20 @@ def main(features_csv, out_dir,
     X_all_sel = df_sel[selected_feats].values
     y_all_sel = (df_sel['Class'] == 'ASD').astype(int).values
 
-    # Determine which models to run
+    # model_keys — base models that go through the HPO loop
     model_keys = ['LR', 'RF', 'SVM', 'LDA']
     if XGB_AVAILABLE:
         model_keys.append('XGB')
+    # all_keys — base models + soft-vote ensemble (for storage and summary)
+    all_keys = model_keys + ['Ensemble']
 
     # Outer CV — stratified so every fold preserves the ASD/NonASD ratio
     outer_cv = StratifiedKFold(n_splits=n_outer, shuffle=True, random_state=42)
 
     # Storage
-    fold_metrics  = {k: [] for k in model_keys}
-    fold_rocs     = {k: [] for k in model_keys}
-    fold_auc_vals = {k: [] for k in model_keys}
+    fold_metrics  = {k: [] for k in all_keys}
+    fold_rocs     = {k: [] for k in all_keys}
+    fold_auc_vals = {k: [] for k in all_keys}
     fold_pipes    = {k: [] for k in model_keys}  # for RF importance
 
     per_fold_rows = []
@@ -696,7 +700,8 @@ def main(features_csv, out_dir,
         inner_cv = StratifiedKFold(n_splits=n_inner, shuffle=True,
                                    random_state=fold_idx)
 
-        fold_auc_parts = {}
+        fold_test_probs = {}   # corrected y_prob per base model — used by ensemble
+        fold_auc_parts  = {}
 
         for key in model_keys:
             if key == 'LDA':
@@ -752,8 +757,9 @@ def main(features_csv, out_dir,
             metrics = eval_holdout(final_pipe, X_te, y_te)
             auc_val = metrics['auc']
 
+            fold_test_probs[key] = metrics['y_prob']   # save for ensemble
             fold_metrics[key].append({k: v for k, v in metrics.items()
-                                      if k not in ('fpr', 'tpr')})
+                                      if k not in ('fpr', 'tpr', 'y_prob')})
             fold_rocs[key].append((metrics['fpr'], metrics['tpr']))
             fold_auc_vals[key].append(auc_val)
             fold_pipes[key].append(final_pipe)
@@ -771,9 +777,45 @@ def main(features_csv, out_dir,
                 'best_params': json.dumps(best_params),
             })
 
+        # ---- Soft-vote ensemble: mean of per-model AUC-corrected probabilities ----
+        ens_prob = np.mean([fold_test_probs[k] for k in model_keys], axis=0)
+        ens_auc  = roc_auc_score(y_te, ens_prob)
+        if ens_auc < 0.5:
+            ens_prob = 1.0 - ens_prob
+            ens_auc  = 1.0 - ens_auc
+        ens_fpr, ens_tpr, _ = roc_curve(y_te, ens_prob)
+        ens_pred = (ens_prob >= 0.5).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y_te, ens_pred, labels=[0, 1]).ravel()
+        ens_acc  = (tp + tn) / (tp + tn + fp + fn)
+        ens_sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        ens_spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        ens_prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        ens_f1   = (2 * ens_prec * ens_sens / (ens_prec + ens_sens)
+                    if (ens_prec + ens_sens) > 0 else 0.0)
+
+        fold_metrics['Ensemble'].append({
+            'auc': ens_auc, 'accuracy': ens_acc, 'sensitivity': ens_sens,
+            'specificity': ens_spec, 'precision': ens_prec, 'f1': ens_f1,
+        })
+        fold_rocs['Ensemble'].append((ens_fpr, ens_tpr))
+        fold_auc_vals['Ensemble'].append(ens_auc)
+        fold_auc_parts['Ensemble'] = ens_auc
+
+        per_fold_rows.append({
+            'fold':        fold_idx + 1,
+            'model':       MODEL_DISPLAY['Ensemble'],
+            'auc':         round(ens_auc,  4),
+            'accuracy':    round(ens_acc,  4),
+            'sensitivity': round(ens_sens, 4),
+            'specificity': round(ens_spec, 4),
+            'f1':          round(ens_f1,   4),
+            'precision':   round(ens_prec, 4),
+            'best_params': '{}',
+        })
+
         # Progress line
         auc_str = '  '.join(
-            f'{k} AUC={fold_auc_parts[k]:.3f}' for k in model_keys)
+            f'{k} AUC={fold_auc_parts[k]:.3f}' for k in all_keys)
         print(f'[Fold {fold_idx+1}/{n_outer}]  {auc_str}')
 
     # -------------------------------------------------------------------------
@@ -794,7 +836,7 @@ def main(features_csv, out_dir,
     }
 
     summary_rows = []
-    for key in model_keys:
+    for key in all_keys:
         row = {'Model': MODEL_DISPLAY[key]}
         for mk in metric_keys:
             vals = [m[mk] for m in fold_metrics[key]]
@@ -833,15 +875,15 @@ def main(features_csv, out_dir,
     print('=' * 60)
 
     plot_roc_mean(
-        fold_rocs, fold_auc_vals, model_keys,
+        fold_rocs, fold_auc_vals, all_keys,
         os.path.join(out_dir, 'plot_roc_all_models.png'),
     )
     plot_model_comparison_bar(
-        summary_df, model_keys,
+        summary_df, all_keys,
         os.path.join(out_dir, 'plot_model_comparison_bar.png'),
     )
     plot_auc_distributions(
-        fold_auc_vals, model_keys,
+        fold_auc_vals, all_keys,
         os.path.join(out_dir, 'plot_auc_distributions.png'),
     )
 
