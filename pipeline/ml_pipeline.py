@@ -63,6 +63,7 @@ from scipy.stats import mannwhitneyu, shapiro, ttest_ind
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import make_scorer, roc_auc_score, roc_curve, confusion_matrix
 from sklearn.model_selection import (
     GridSearchCV,
@@ -109,14 +110,18 @@ MODEL_COLORS = ['#1B7837', '#2166AC', '#D6604D', '#762A83', '#E08214', '#8B4513'
 
 # Grid search parameter grids for LR and SVM.
 # Keys use the 'model__' pipeline prefix so GridSearchCV can set them directly.
+# Grids start at values appropriate for standardised features (never at 1e-3 /
+# 1e-4 which collapse SVM to a constant-class predictor on small datasets).
 PARAM_GRID = {
+    # LR: pipeline step 'model' is LogisticRegression directly → model__<param>
     'LR': {
-        'model__C':        [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0],
+        'model__C':        [0.01, 0.1, 1.0, 10.0, 100.0],
         'model__l1_ratio': [0.0, 0.25, 0.5, 0.75, 1.0],
     },
+    # SVM: pipeline step 'model' is CalibratedClassifierCV(SVC) → model__estimator__<param>
     'SVM': {
-        'model__C':     [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0],
-        'model__gamma': [1e-4, 1e-3, 1e-2, 1e-1, 1.0],
+        'model__estimator__C':     [0.1, 1.0, 10.0, 100.0, 1000.0],
+        'model__estimator__gamma': ['scale', 0.01, 0.1, 1.0],
     },
 }
 
@@ -329,7 +334,7 @@ def build_pipe(model_key, params, rng=42):
             l1_ratio=params.get('l1_ratio', 0.5),
         )
     elif model_key == 'RF':
-        estimator = RandomForestClassifier(
+        base_rf = RandomForestClassifier(
             random_state=rng, n_jobs=-1,
             class_weight='balanced',
             n_estimators=params.get('n_estimators', 200),
@@ -337,13 +342,19 @@ def build_pipe(model_key, params, rng=42):
             min_samples_leaf=params.get('min_samples_leaf', 1),
             max_depth=params.get('max_depth', None),
         )
+        # Isotonic calibration corrects the well-known RF probability
+        # overconfidence (predicted probs cluster near 0 and 1).
+        estimator = CalibratedClassifierCV(base_rf, cv=3, method='isotonic')
     elif model_key == 'SVM':
-        estimator = SVC(
-            kernel='rbf', probability=True, random_state=rng,
+        base_svm = SVC(
+            kernel='rbf', random_state=rng,
             class_weight='balanced',
             C=params.get('C', 1.0),
             gamma=params.get('gamma', 'scale'),
         )
+        # Sigmoid (Platt) calibration via proper held-out CV folds is more
+        # reliable than SVC(probability=True) which calibrates on training data.
+        estimator = CalibratedClassifierCV(base_svm, cv=3, method='sigmoid')
     elif model_key == 'LDA':
         # Ledoit-Wolf automatic shrinkage — no hyperparameters to tune.
         # LDA uses estimated class priors, which accounts for imbalance.
@@ -399,14 +410,34 @@ def make_objective(model_key, X_tr, y_tr, inner_cv, rng):
 
 
 # =============================================================================
-# Per-fold evaluation helper
+# Threshold optimisation and per-fold evaluation helper
 # =============================================================================
 
-def eval_holdout(final_pipe, X_te, y_te):
+def find_best_threshold(y_true, y_prob):
+    """
+    Find the classification threshold that maximises Youden's J statistic
+    (sensitivity + specificity - 1) on the given labelled data.
+
+    Using Youden's J targets a balanced improvement in both sensitivity and
+    specificity rather than a fixed 0.5 cut-off, which is only optimal when
+    class sizes and misclassification costs are equal (neither holds here).
+
+    The result is clamped to [0.05, 0.95] to avoid degenerate thresholds
+    driven by a single mis-ordered probability on a tiny dataset.
+    """
+    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+    j_scores = tpr - fpr          # Youden's J = sensitivity + specificity - 1
+    best_idx  = int(np.argmax(j_scores))
+    return float(np.clip(thresholds[best_idx], 0.05, 0.95))
+
+
+def eval_holdout(final_pipe, X_te, y_te, threshold=0.5):
     """
     Evaluate a fitted pipeline on the held-out test set.
     Returns dict of metrics, (fpr, tpr) arrays, and the AUC-corrected y_prob.
-    y_pred is derived from the corrected y_prob so metrics are consistent.
+    threshold: classification cut-off applied to the corrected probabilities.
+      Pass the value returned by find_best_threshold(y_tr, tr_prob) so that
+      the cut-off is determined from training data, not the test fold.
     """
     y_prob  = final_pipe.predict_proba(X_te)[:, 1]
     auc_val = roc_auc_score(y_te, y_prob)
@@ -415,7 +446,7 @@ def eval_holdout(final_pipe, X_te, y_te):
         auc_val = 1.0 - auc_val
 
     fpr, tpr, _ = roc_curve(y_te, y_prob)
-    y_pred = (y_prob >= 0.5).astype(int)   # threshold on corrected probabilities
+    y_pred = (y_prob >= threshold).astype(int)
 
     cm = confusion_matrix(y_te, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
@@ -441,8 +472,15 @@ def eval_holdout(final_pipe, X_te, y_te):
 # =============================================================================
 
 def plot_rf_importance(rf_estimator, feature_names, out_path):
-    """Horizontal bar chart of RF feature importances (Gini)."""
-    imp   = rf_estimator.feature_importances_
+    """Horizontal bar chart of RF feature importances (Gini).
+    rf_estimator may be a CalibratedClassifierCV wrapping a RandomForestClassifier;
+    importances are averaged across calibration folds in that case.
+    """
+    if isinstance(rf_estimator, CalibratedClassifierCV):
+        imp = np.mean([clf.estimator.feature_importances_
+                       for clf in rf_estimator.calibrated_classifiers_], axis=0)
+    else:
+        imp = rf_estimator.feature_importances_
     order = np.argsort(imp)
     fig, ax = plt.subplots(figsize=(7, max(4, len(feature_names) * 0.4)))
     ax.barh(np.array(feature_names)[order], imp[order],
@@ -706,8 +744,9 @@ def main(features_csv, out_dir,
         inner_cv = StratifiedKFold(n_splits=n_inner, shuffle=True,
                                    random_state=fold_idx)
 
-        fold_test_probs = {}   # corrected y_prob per base model — used by ensemble
-        fold_auc_parts  = {}
+        fold_test_probs  = {}   # AUC-corrected test probs — used by ensemble
+        fold_train_probs = {}   # AUC-corrected train probs — used for ens threshold
+        fold_auc_parts   = {}
 
         for key in model_keys:
             if key == 'LDA':
@@ -730,8 +769,12 @@ def main(features_csv, out_dir,
                 )
                 gs.fit(X_tr, y_tr)
                 final_pipe  = gs.best_estimator_
-                best_params = {k.replace('model__', ''): v
-                               for k, v in gs.best_params_.items()}
+                # Strip pipeline prefixes: 'model__estimator__C' → 'C',
+                # 'model__C' → 'C'.  Works for both LR and calibrated SVM.
+                best_params = {
+                    k.replace('model__estimator__', '').replace('model__', ''): v
+                    for k, v in gs.best_params_.items()
+                }
 
             else:
                 # Optuna TPE — efficient for higher-dimensional spaces (RF: 3, XGB: 7).
@@ -762,11 +805,18 @@ def main(features_csv, out_dir,
                 final_pipe = build_pipe(key, final_params, fold_idx)
                 final_pipe.fit(X_tr, y_tr)
 
-            # Evaluate on outer test fold
-            metrics = eval_holdout(final_pipe, X_te, y_te)
+            # Find optimal threshold from outer TRAINING set (Youden's J),
+            # then evaluate on the outer TEST fold using that threshold.
+            tr_prob_raw = final_pipe.predict_proba(X_tr)[:, 1]
+            tr_auc_raw  = roc_auc_score(y_tr, tr_prob_raw)
+            tr_prob_dir = (1.0 - tr_prob_raw if tr_auc_raw < 0.5 else tr_prob_raw)
+            opt_thresh  = find_best_threshold(y_tr, tr_prob_dir)
+
+            metrics = eval_holdout(final_pipe, X_te, y_te, threshold=opt_thresh)
             auc_val = metrics['auc']
 
-            fold_test_probs[key] = metrics['y_prob']   # save for ensemble
+            fold_test_probs[key]  = metrics['y_prob']   # AUC-corrected; for ensemble
+            fold_train_probs[key] = tr_prob_dir          # for ensemble threshold
             fold_metrics[key].append({k: v for k, v in metrics.items()
                                       if k not in ('fpr', 'tpr', 'y_prob')})
             fold_rocs[key].append((metrics['fpr'], metrics['tpr']))
@@ -787,13 +837,18 @@ def main(features_csv, out_dir,
             })
 
         # ---- Soft-vote ensemble: mean of per-model AUC-corrected probabilities ----
+        # Threshold is found from the averaged TRAINING probabilities (Youden's J),
+        # then applied to the averaged TEST probabilities.
+        ens_tr_prob = np.mean([fold_train_probs[k] for k in model_keys], axis=0)
+        ens_thresh  = find_best_threshold(y_tr, ens_tr_prob)
+
         ens_prob = np.mean([fold_test_probs[k] for k in model_keys], axis=0)
         ens_auc  = roc_auc_score(y_te, ens_prob)
         if ens_auc < 0.5:
             ens_prob = 1.0 - ens_prob
             ens_auc  = 1.0 - ens_auc
         ens_fpr, ens_tpr, _ = roc_curve(y_te, ens_prob)
-        ens_pred = (ens_prob >= 0.5).astype(int)
+        ens_pred = (ens_prob >= ens_thresh).astype(int)
         tn, fp, fn, tp = confusion_matrix(y_te, ens_pred, labels=[0, 1]).ravel()
         ens_acc  = (tp + tn) / (tp + tn + fp + fn)
         ens_sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
