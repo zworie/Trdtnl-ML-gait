@@ -307,3 +307,57 @@ votes > n_base / 2   (i.e., strictly more than half the models vote ASD)
 ```
 
 With 5 base models, this requires 3 or more votes. The raw vote count (0–5) is used as an ordinal score for AUC computation (with auto-direction correction applied if necessary).
+
+---
+
+## 9. Class Imbalance, Calibration, and Threshold
+
+### 9.1 Class imbalance handling
+
+The dataset has a mild imbalance (30 ASD vs 42 Non-ASD, ratio 1:1.4). The original R pipeline applied SMOTE oversampling to the scaled training set before each model fit. The Python pipeline replaces SMOTE with native imbalance handling:
+
+| Model | Method | Details |
+|-------|--------|---------|
+| LR | `class_weight='balanced'` | Sklearn computes `n_samples / (n_classes × n_class_i)` per class; effectively upweights ASD loss |
+| SVM | `class_weight='balanced'` | Penalty `C` scaled inversely by class frequency |
+| RF | `class_weight='balanced'` | Each tree's sample weights adjusted; combined with isotonic calibration |
+| LDA | Estimated priors | Class frequencies from training set used as class priors directly |
+| XGB | `scale_pos_weight = n_neg / n_pos` | Computed per outer fold from actual fold class counts; XGBoost equivalent of balanced weighting |
+
+Advantages over SMOTE:
+- No synthetic data generation — every sample in training is a real subject
+- No risk of synthetic-sample leakage if SMOTE were placed outside the inner CV (the R code applied SMOTE to the full 70% training set before any inner CV, creating a mild additional leakage source)
+- Computationally cheaper
+
+### 9.2 Threshold optimisation (Youden's J)
+
+The default decision threshold of 0.5 is suboptimal when class sizes or costs are unequal. The pipeline replaces it with **Youden's J statistic**:
+
+```
+threshold* = argmax_{t} [ TPR(t) − FPR(t) ]
+```
+
+Procedure per outer fold:
+1. After fitting each base model on the outer training set, compute predicted probabilities on that same training set (no test data used).
+2. Apply AUC correction to the training probabilities (flip if AUC < 0.5).
+3. Compute the ROC curve on training probabilities.
+4. Select `threshold* = argmax(tpr − fpr)`, clamped to [0.05, 0.95] to avoid degenerate thresholds.
+5. Apply this threshold to test-set probabilities to produce binary predictions.
+
+This maximises the sum of sensitivity and specificity on the training set, reducing the sensitivity deficit caused by the majority-class bias of a fixed 0.5 threshold.
+
+### 9.3 Probability calibration
+
+Raw model probabilities are often poorly calibrated (overconfident or underconfident), especially from SVM and RF. Miscalibrated probabilities degrade ensemble performance and threshold selection.
+
+| Model | Calibration | Rationale |
+|-------|-------------|-----------|
+| RF | `CalibratedClassifierCV(cv=3, method='isotonic')` | RF probabilities are biased toward 0/1 extremes; isotonic regression corrects this monotonically |
+| SVM | `CalibratedClassifierCV(cv=3, method='sigmoid')` | SVM has no native probabilistic output; sigmoid (Platt scaling) maps decision scores to probabilities |
+| LR | None | Logistic regression outputs are inherently well-calibrated probabilities |
+| LDA | None | Gaussian LDA probabilities are calibrated under the model's assumptions |
+| XGB | None | XGBoost with `eval_metric='logloss'` is trained to optimise log-loss, which encourages calibration |
+
+`CalibratedClassifierCV(cv=3)` uses 3-fold internal cross-fitting: the calibrator is trained on held-out predictions, avoiding fitting on the same data used to train the base model. This is distinct from the deprecated `SVC(probability=True)` approach, which calibrates on the full training set.
+
+**Parameter routing note:** When `CalibratedClassifierCV` wraps a base estimator, sklearn `Pipeline` parameter routing prefixes HPO keys with `estimator__` rather than the model name directly. The SVM grid uses keys `model__estimator__C` and `model__estimator__gamma` to route through the calibration wrapper to the underlying `SVC`.
