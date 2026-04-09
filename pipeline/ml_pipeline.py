@@ -357,13 +357,16 @@ def make_objective(model_key, X_tr, y_tr, inner_cv, rng):
     def objective(trial):
         params = suggest_params(trial, model_key)
         pipe   = build_pipe(model_key, params, rng)
+        # n_jobs=1: avoids joblib pool corruption when called from Optuna's loop.
+        # error_score=0.5: failed folds return 0.5 (random chance) rather than NaN.
         scores = cross_val_score(
             pipe, X_tr, y_tr,
             cv=inner_cv,
             scoring=corrected_auc_scorer,
-            n_jobs=-1,
+            n_jobs=1,
+            error_score=0.5,
         )
-        return scores.mean()
+        return float(np.nanmean(scores))
     return objective
 
 
@@ -680,7 +683,14 @@ def main(features_csv, out_dir,
                 show_progress_bar=False,
             )
 
-            best_params = study.best_params.copy()
+            completed = [t for t in study.trials
+                         if t.state == optuna.trial.TrialState.COMPLETE]
+            if not completed:
+                print(f'  [WARN] All {n_trials} trials failed for {key} '
+                      f'(seed {seed_idx}); using default params.')
+                best_params = {}
+            else:
+                best_params = study.best_params.copy()
 
             # Build final pipe with best params; RF bumped to 1000 trees
             final_params = best_params.copy()
