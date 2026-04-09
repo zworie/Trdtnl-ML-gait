@@ -34,6 +34,7 @@ It is a methodologically improved conversion of the original `thesis.R`.
 | **LDA** (Ledoit-Wolf) | None | Automatic covariance shrinkage; uses estimated class priors; ideal for small N |
 | **XGBoost** | Optuna TPE | `scale_pos_weight = n_neg/n_pos` per fold; extension beyond published thesis |
 | **Soft-Vote Ensemble** | — | Averages AUC-corrected probabilities from all 5 base models |
+| **Majority-Vote Ensemble** | — | Each base model casts a 0/1 vote; ASD if strictly > half the models agree |
 
 ### How the nested CV works
 
@@ -215,8 +216,8 @@ All outputs are saved in `outputs/`:
 
 | File | Description |
 |------|-------------|
-| `model_comparison_results.csv` | **mean ± std** of AUC, Accuracy, Sensitivity, Specificity, F1, Precision across all outer folds — one row per model (6 rows) |
-| `per_fold_results.csv` | Raw metrics for every (fold × model) combination — 5 folds × 6 models = 30 rows |
+| `model_comparison_results.csv` | **mean ± std** of AUC, Accuracy, Sensitivity, Specificity, F1, Precision across all outer folds — one row per model (7 rows) |
+| `per_fold_results.csv` | Raw metrics for every (fold × model) combination — 5 folds × 7 models = 35 rows |
 | `statistical_test_results.csv` | p-values and test type for all retained features |
 | `plot_sig_features_boxplot.png` | Boxplots of statistically significant features (ASD vs Non-ASD) |
 | `plot_rf_importance.png` | RF feature importance (Gini) from the fold with the highest RF AUC |

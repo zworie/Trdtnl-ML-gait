@@ -103,10 +103,11 @@ MODEL_DISPLAY = {
     'LDA':      'LDA (Ledoit-Wolf)',
     'XGB':      'XGBoost',
     'Ensemble': 'Soft-Vote Ensemble',
+    'MajVote':  'Majority-Vote Ensemble',
 }
 
 PALETTE      = {'ASD': '#D6604D', 'NonASD': '#4393C3'}
-MODEL_COLORS = ['#1B7837', '#2166AC', '#D6604D', '#762A83', '#E08214', '#8B4513']
+MODEL_COLORS = ['#1B7837', '#2166AC', '#D6604D', '#762A83', '#E08214', '#8B4513', '#4D4D4D']
 
 # Grid search parameter grids for LR and SVM.
 # Keys use the 'model__' pipeline prefix so GridSearchCV can set them directly.
@@ -464,6 +465,7 @@ def eval_holdout(final_pipe, X_te, y_te, threshold=0.5):
         'precision': precision, 'f1': f1,
         'fpr': fpr, 'tpr': tpr,
         'y_prob': y_prob,   # corrected; used by soft-vote ensemble
+        'y_pred': y_pred,   # threshold-based; used by majority-vote ensemble
     }
 
 
@@ -720,8 +722,8 @@ def main(features_csv, out_dir,
     model_keys = ['LR', 'RF', 'SVM', 'LDA']
     if XGB_AVAILABLE:
         model_keys.append('XGB')
-    # all_keys — base models + soft-vote ensemble (for storage and summary)
-    all_keys = model_keys + ['Ensemble']
+    # all_keys — base models + both ensemble types
+    all_keys = model_keys + ['Ensemble', 'MajVote']
 
     # Outer CV — stratified so every fold preserves the ASD/NonASD ratio
     outer_cv = StratifiedKFold(n_splits=n_outer, shuffle=True, random_state=42)
@@ -744,8 +746,9 @@ def main(features_csv, out_dir,
         inner_cv = StratifiedKFold(n_splits=n_inner, shuffle=True,
                                    random_state=fold_idx)
 
-        fold_test_probs  = {}   # AUC-corrected test probs — used by ensemble
+        fold_test_probs  = {}   # AUC-corrected test probs — used by soft-vote ensemble
         fold_train_probs = {}   # AUC-corrected train probs — used for ens threshold
+        fold_test_preds  = {}   # threshold-based predictions — used by majority-vote
         fold_auc_parts   = {}
 
         for key in model_keys:
@@ -815,8 +818,9 @@ def main(features_csv, out_dir,
             metrics = eval_holdout(final_pipe, X_te, y_te, threshold=opt_thresh)
             auc_val = metrics['auc']
 
-            fold_test_probs[key]  = metrics['y_prob']   # AUC-corrected; for ensemble
-            fold_train_probs[key] = tr_prob_dir          # for ensemble threshold
+            fold_test_probs[key]  = metrics['y_prob']   # AUC-corrected; for soft-vote
+            fold_train_probs[key] = tr_prob_dir          # for ensemble thresholds
+            fold_test_preds[key]  = metrics['y_pred']   # for majority-vote
             fold_metrics[key].append({k: v for k, v in metrics.items()
                                       if k not in ('fpr', 'tpr', 'y_prob')})
             fold_rocs[key].append((metrics['fpr'], metrics['tpr']))
@@ -874,6 +878,53 @@ def main(features_csv, out_dir,
             'specificity': round(ens_spec, 4),
             'f1':          round(ens_f1,   4),
             'precision':   round(ens_prec, 4),
+            'best_params': '{}',
+        })
+
+        # ---- Majority-vote ensemble ----
+        # Each base model casts a 0/1 vote (from its threshold-based prediction).
+        # The subject is classified ASD when strictly more than half the models vote ASD.
+        # The vote count (0..n_base) is also used as an ordinal AUC score.
+        n_base     = len(model_keys)
+        vote_score = np.sum([fold_test_preds[k] for k in model_keys],
+                            axis=0).astype(float)
+        maj_pred   = (vote_score > n_base / 2).astype(int)
+
+        # AUC: use vote count as ordinal ranking score; auto-correct direction
+        maj_auc_raw = roc_auc_score(y_te, vote_score)
+        if maj_auc_raw < 0.5:
+            vote_score_roc = -vote_score   # flip score for ROC curve only
+            maj_auc = 1.0 - maj_auc_raw
+        else:
+            vote_score_roc = vote_score
+            maj_auc = maj_auc_raw
+        maj_fpr, maj_tpr, _ = roc_curve(y_te, vote_score_roc)
+
+        tn, fp, fn, tp = confusion_matrix(y_te, maj_pred, labels=[0, 1]).ravel()
+        maj_acc  = (tp + tn) / (tp + tn + fp + fn)
+        maj_sens = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        maj_spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        maj_prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        maj_f1   = (2 * maj_prec * maj_sens / (maj_prec + maj_sens)
+                    if (maj_prec + maj_sens) > 0 else 0.0)
+
+        fold_metrics['MajVote'].append({
+            'auc': maj_auc, 'accuracy': maj_acc, 'sensitivity': maj_sens,
+            'specificity': maj_spec, 'precision': maj_prec, 'f1': maj_f1,
+        })
+        fold_rocs['MajVote'].append((maj_fpr, maj_tpr))
+        fold_auc_vals['MajVote'].append(maj_auc)
+        fold_auc_parts['MajVote'] = maj_auc
+
+        per_fold_rows.append({
+            'fold':        fold_idx + 1,
+            'model':       MODEL_DISPLAY['MajVote'],
+            'auc':         round(maj_auc,  4),
+            'accuracy':    round(maj_acc,  4),
+            'sensitivity': round(maj_sens, 4),
+            'specificity': round(maj_spec, 4),
+            'f1':          round(maj_f1,   4),
+            'precision':   round(maj_prec, 4),
             'best_params': '{}',
         })
 
