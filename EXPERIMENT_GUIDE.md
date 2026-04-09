@@ -15,26 +15,27 @@ It is a methodologically improved conversion of the original `thesis.R`.
 |-----------|----------------------|-----------------|
 | Evaluation | Single 70/30 split → 1 result | **Nested 5×5 stratified CV** → all 72 subjects evaluated as test → mean ± std |
 | Stratification | Single stratified split | **Every outer and inner fold is stratified** — class ratio preserved throughout |
-| Models | LR, RF, SVM | **LR, RF, SVM, LDA, XGBoost + Soft-Vote Ensemble** |
-| HPO — LR | GridSearchCV | **GridSearchCV** (6×5 = 30 grid points, C × l1\_ratio) |
-| HPO — SVM | GridSearchCV | **GridSearchCV** (6×5 = 30 grid points, C × gamma) |
-| HPO — RF | GridSearchCV | **Optuna TPE** (3 continuous params, 50 trials) |
-| HPO — XGBoost | GridSearchCV | **Optuna TPE** (7 continuous params, 50 trials) |
+| Models | LR, RF, SVM | **LR, RF, SVM, LDA, XGBoost + Soft-Vote + Majority-Vote Ensembles** |
+| HPO — LR | GridSearchCV | **GridSearchCV** (5×5 = 25 grid points, C × l1\_ratio) |
+| HPO — SVM | GridSearchCV | **GridSearchCV** (5×4 = 20 grid points, C × gamma) |
+| HPO — RF | GridSearchCV | **Optuna TPE** (3 params, 50 trials) or **GridSearchCV** via `--hpo grid` |
+| HPO — XGBoost | GridSearchCV | **Optuna TPE** (7 params, 50 trials) or **GridSearchCV** via `--hpo grid` |
 | HPO — LDA | — | **None** — Ledoit-Wolf shrinkage is fully automatic |
-| Class imbalance | SMOTE before CV (mild leakage) | **`class_weight='balanced'`** (LR/SVM/RF) and **`scale_pos_weight`** (XGB) — no synthetic samples, no leakage |
-| SVM AUC | Could be < 0.5 from Platt inversion | **Auto-corrected** in both HPO scoring and evaluation |
+| Class imbalance | SMOTE before CV (mild leakage) | **`class_weight='balanced'`** (default) or **SMOTE inside CV** via `--smote` |
+| Decision threshold | Fixed 0.5 | **Youden's J** optimised per fold on training data |
+| Probability calibration | Platt on training data (SVM) | **`CalibratedClassifierCV`** (held-out folds) for RF (isotonic) and SVM (sigmoid) |
 
 ### Models
 
 | Model | HPO method | Notes |
 |-------|------------|-------|
-| **Logistic Regression** (Elastic Net) | GridSearchCV | `class_weight='balanced'`; sparse + ridge regularisation combined |
-| **Random Forest** | Optuna TPE | `class_weight='balanced'`; 200 trees during search, 1 000 for final fit |
-| **SVM** (RBF kernel) | GridSearchCV | `class_weight='balanced'`; `probability=True` for AUC scoring |
-| **LDA** (Ledoit-Wolf) | None | Automatic covariance shrinkage; uses estimated class priors; ideal for small N |
-| **XGBoost** | Optuna TPE | `scale_pos_weight = n_neg/n_pos` per fold; extension beyond published thesis |
-| **Soft-Vote Ensemble** | — | Averages AUC-corrected probabilities from all 5 base models |
-| **Majority-Vote Ensemble** | — | Each base model casts a 0/1 vote; ASD if strictly > half the models agree |
+| **Logistic Regression** (Elastic Net) | GridSearchCV | `class_weight='balanced'`; L1+L2 regularisation |
+| **Random Forest** | Optuna TPE (default) or GridSearch | `class_weight='balanced'`; 200 trees during search, 1 000 for final fit; isotonic calibration |
+| **SVM** (RBF kernel) | GridSearchCV | `class_weight='balanced'`; sigmoid (Platt) calibration |
+| **LDA** (Ledoit-Wolf) | None | Automatic covariance shrinkage; estimated class priors; ideal for small N |
+| **XGBoost** | Optuna TPE (default) or GridSearch | `scale_pos_weight = n_neg/n_pos` per fold; extension beyond published thesis |
+| **Soft-Vote Ensemble** | — | Arithmetic mean of 5 AUC-corrected probability arrays |
+| **Majority-Vote Ensemble** | — | Each base model casts a 0/1 vote; ASD if strictly > half agree |
 
 ### How the nested CV works
 
@@ -44,18 +45,15 @@ preserved in every fold.
 
 For each outer fold, the ~58 training subjects go into the inner loop:
 
-- **LR and SVM**: `GridSearchCV` with a 5-fold stratified inner CV exhaustively
-  evaluates the full parameter grid and refits the winner on the full outer training set.
-- **RF and XGB**: Optuna TPE samples 50 hyperparameter configurations, each
-  evaluated via 5-fold stratified inner CV, then refits the winner on the full
-  outer training set.
+- **LR and SVM**: `GridSearchCV` with a 5-fold stratified inner CV.
+- **RF and XGB**: Optuna TPE samples 50 configurations via 5-fold stratified inner CV
+  (or `GridSearchCV` when `--hpo grid` is set).
 - **LDA**: Fit directly — no tuning needed.
 
-After all five base models are evaluated on the outer test fold, their
-probability scores are averaged to produce the **Ensemble** prediction.
+After HPO, a **Youden's J threshold** is found on the outer training probabilities
+and applied to test-set predictions (replaces the fixed 0.5 cut-off).
 
-Class imbalance is handled natively (no synthetic data): `class_weight='balanced'` for
-LR/SVM/RF and `scale_pos_weight = n_neg/n_pos` (computed per outer fold) for XGB.
+Both ensemble models are built from the five base-model predictions on each outer test fold.
 
 ---
 
@@ -80,7 +78,8 @@ Trdtnl-ML-gait/
 │   └── ml_pipeline.py                 ← Python ML pipeline (use this)
 ├── requirements.txt
 ├── EXPERIMENT_GUIDE.md                ← this file
-└── FINDINGS.md                        ← audit notes and discrepancies
+├── FINDINGS.md                        ← audit notes and discrepancies
+└── TECHNICAL_DOCUMENTATION.md        ← full pipeline documentation
 ```
 
 ---
@@ -114,12 +113,10 @@ You should see `(venv)` at the start of your prompt once activated.
 pip install -r requirements.txt
 ```
 
-This installs: numpy, pandas, scipy, scikit-learn, boruta, xgboost, optuna, matplotlib, seaborn.
+This installs: numpy, pandas, scipy, scikit-learn, boruta, imbalanced-learn, xgboost, optuna, matplotlib, seaborn.
 
-> **Updating an existing environment:** If you had a previous `venv` with `imbalanced-learn`
-> installed, that package is no longer needed (SMOTE was replaced). You can either delete and
-> recreate the `venv`, or simply run `pip install -r requirements.txt` again — the new
-> packages will install and the removed ones are not uninstalled (they are harmless if left).
+> **Updating an existing environment:** Run `pip install -r requirements.txt` again.
+> New packages will install and old ones remain harmless.
 
 ---
 
@@ -188,18 +185,97 @@ For a quick test run (completes in ~1–2 minutes):
 python pipeline/ml_pipeline.py --n-trials 10 --n-outer 3 --n-inner 3
 ```
 
-#### All CLI options
+---
+
+### All CLI options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--features` | `gait_features_rich.csv` | Input feature CSV |
-| `--out` | `outputs/` | Output directory |
+| `--out DIR` | `outputs/` | Directory for all output files and plots |
 | `--selected-features` | *(run Boruta)* | Skip Boruta; use these exact feature names |
-| `--n-trials` | `50` | Optuna trials per model per outer fold (RF and XGB only) |
-| `--n-outer` | `5` | Number of outer CV folds |
-| `--n-inner` | `5` | Number of inner CV folds for HPO |
+| `--n-outer N` | `5` | Number of outer CV folds |
+| `--n-inner N` | `5` | Number of inner CV folds for HPO |
+| `--n-trials N` | `50` | Optuna trials per model per outer fold (RF and XGB only; ignored when `--hpo grid`) |
+| `--smote` | off | Apply SMOTE oversampling inside each inner CV fold (see below) |
+| `--hpo {optuna,grid}` | `optuna` | HPO method for RF and XGB (see below) |
+| `--log FILE` | off | Write all terminal output to FILE in addition to the console |
 
-#### Anchor to thesis features (skip Boruta)
+---
+
+### Option: `--smote` — SMOTE oversampling
+
+By default the pipeline handles class imbalance via `class_weight='balanced'` (LR/SVM/RF)
+and `scale_pos_weight` (XGB). Pass `--smote` to use SMOTE instead:
+
+```bash
+python pipeline/ml_pipeline.py --smote
+```
+
+When `--smote` is active:
+- `SMOTE` is prepended as a pipeline step and runs **inside every inner CV fold**
+  so no synthetic samples from the test fold ever enter training.
+- `class_weight` is set to `None` for LR/SVM/RF and `scale_pos_weight=1.0` for XGB
+  to avoid double-correcting for class imbalance.
+- Requires `imbalanced-learn` (already in `requirements.txt`).
+
+---
+
+### Option: `--hpo {optuna,grid}` — HPO method for RF and XGB
+
+```bash
+# Default: Optuna TPE (flexible, samples continuous param space)
+python pipeline/ml_pipeline.py --hpo optuna
+
+# Grid search: faster, uses a predefined coarse grid
+python pipeline/ml_pipeline.py --hpo grid
+```
+
+| Setting | RF | XGB | LR | SVM | LDA |
+|---------|-----|-----|-----|-----|-----|
+| `optuna` (default) | Optuna TPE, 50 trials | Optuna TPE, 50 trials | GridSearch | GridSearch | none |
+| `grid` | GridSearchCV (coarse grid) | GridSearchCV (coarse grid) | GridSearch | GridSearch | none |
+
+`--hpo grid` is faster but less thorough. It is useful for quick experiments or
+when Optuna is slow on your machine.
+
+---
+
+### Option: `--log FILE` — save terminal output to a file
+
+```bash
+python pipeline/ml_pipeline.py --log outputs/run.log
+```
+
+All printed output is written to both the console and `run.log` simultaneously.
+Useful for recording results from long runs.
+
+---
+
+### Option: `--out DIR` — custom output directory
+
+```bash
+python pipeline/ml_pipeline.py --out results/experiment_smote
+```
+
+The directory is created if it does not exist. Use different `--out` values to
+keep results from separate experiments side-by-side without overwriting.
+
+---
+
+### Option: `--n-outer` / `--n-inner` — fold counts
+
+```bash
+# Full run with more outer folds for better variance estimate
+python pipeline/ml_pipeline.py --n-outer 10 --n-inner 5
+
+# Quick 3-fold run for debugging
+python pipeline/ml_pipeline.py --n-outer 3 --n-inner 3 --n-trials 5
+```
+
+---
+
+### Anchor to thesis features (skip Boruta)
 
 To replicate the 8 features confirmed in the published thesis:
 
@@ -210,9 +286,11 @@ python pipeline/ml_pipeline.py \
     LDP_cv TrunkY_max CoM_Y_min StepLength
 ```
 
+---
+
 ### Step 4 — View Results
 
-All outputs are saved in `outputs/`:
+All outputs are saved in `outputs/` (or the directory specified by `--out`):
 
 | File | Description |
 |------|-------------|
@@ -251,43 +329,53 @@ The published thesis result (R code, single hold-out test set):
 The Python pipeline uses a different evaluation framework (nested CV vs single 70/30 split)
 and different implementations, so direct numerical comparison is not meaningful.
 Expect mean AUC values in the **0.70–0.95 range** with std 0.05–0.15, reflecting genuine
-variability on this 72-subject dataset.  The Ensemble and LDA models often match or exceed
-individual model AUC on small datasets.
+variability on this 72-subject dataset.
 
 ### Stochasticity and reproducibility
 
-The outer CV uses `random_state=42`.  Each inner CV uses `random_state=fold_idx` (0–4)
+The outer CV uses `random_state=42`. Each inner CV uses `random_state=fold_idx` (0–4)
 so every fold's hyperparameter search is independently seeded.
-Optuna studies are seeded from `fold_idx`.  Results are fully reproducible
+Optuna studies are seeded from `fold_idx`. Results are fully reproducible
 across runs on the same machine and library version.
 
 ---
 
-## Custom Paths and Examples
+## Example Recipes
 
 ```bash
-# Feature extraction with custom input/output paths
+# Default full run
+python pipeline/ml_pipeline.py
+
+# Quick 3-fold smoke test (~ 1 minute)
+python pipeline/ml_pipeline.py --n-outer 3 --n-inner 3 --n-trials 5
+
+# Thesis features, log output, custom output folder
+python pipeline/ml_pipeline.py \
+    --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt \
+                        LDP_cv TrunkY_max CoM_Y_min StepLength \
+    --out outputs/thesis_features \
+    --log outputs/thesis_features/run.log
+
+# SMOTE + grid search (faster run, SMOTE-balanced training)
+python pipeline/ml_pipeline.py \
+    --smote --hpo grid \
+    --out outputs/smote_grid \
+    --log outputs/smote_grid/run.log
+
+# SMOTE + Optuna with more trials
+python pipeline/ml_pipeline.py \
+    --smote --n-trials 100 \
+    --out outputs/smote_optuna
+
+# Compare SMOTE vs no-SMOTE side by side
+python pipeline/ml_pipeline.py --out outputs/no_smote
+python pipeline/ml_pipeline.py --smote --out outputs/with_smote
+
+# Feature extraction with custom paths
 python pipeline/feature_extraction.py \
     --side "Side Dataset 25KP New GC.csv" \
     --front "Front Dataset 25KP New GC.csv" \
     --out outputs/my_features.csv
-
-# Verify against the ground-truth CSV
-python pipeline/feature_extraction.py --verify
-
-# ML pipeline — quick test (3 outer folds, 3 inner folds, 10 Optuna trials)
-python pipeline/ml_pipeline.py --n-trials 10 --n-outer 3 --n-inner 3
-
-# ML pipeline with thesis features (skip Boruta) and full default settings
-python pipeline/ml_pipeline.py \
-    --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt \
-                        LDP_cv TrunkY_max CoM_Y_min StepLength
-
-# ML pipeline with thesis features and more Optuna trials
-python pipeline/ml_pipeline.py \
-    --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt \
-                        LDP_cv TrunkY_max CoM_Y_min StepLength \
-    --n-trials 100 --n-outer 5 --n-inner 5
 ```
 
 ---
@@ -295,10 +383,12 @@ python pipeline/ml_pipeline.py \
 ## Notes
 
 - The `outputs/` directory is listed in `.gitignore` and is not committed to the repository.
-  Regenerate it by running the pipeline.
+  Regenerate it by running the pipeline. Use `--out` to save to a different folder.
 - The `venv/` directory is also excluded from git.
 - Boruta feature selection runs on the full 72-subject dataset before the CV loop (a
   data-leakage limitation inherited from the original R code; documented in `FINDINGS.md`).
   Use `--selected-features` to bypass Boruta entirely and anchor the pipeline to the 8
   thesis-confirmed features.
-- For details on methodological discrepancies between the thesis and the code, see `FINDINGS.md`.
+- For full technical details (algorithm choices, all parameters, results table, differences
+  from thesis), see `TECHNICAL_DOCUMENTATION.md`.
+- For methodological discrepancies between the thesis and the code, see `FINDINGS.md`.
