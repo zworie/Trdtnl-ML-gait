@@ -217,6 +217,17 @@ def evaluate_model(estimator, X_test, y_test, name, pos_label=1):
     """
     Compute and print confusion matrix + metrics for one model.
     Returns a result dict compatible with the comparison table.
+
+    AUC direction correction
+    ------------------------
+    R's pROC::roc() auto-detects whether higher predictor values correspond
+    to the positive or negative class and adjusts the ROC direction.
+    sklearn's roc_auc_score does not — it assumes higher = positive.
+
+    SVC's Platt scaling (probability=True) can invert the probability
+    direction on small / SMOTE'd datasets, producing AUC < 0.5 even when
+    the hard predictions are correct.  We replicate R's auto-detection:
+    if AUC < 0.5, flip the probability scores for ROC/AUC computation.
     """
     y_prob = estimator.predict_proba(X_test)[:, 1]
     y_pred = estimator.predict(X_test)
@@ -231,8 +242,17 @@ def evaluate_model(estimator, X_test, y_test, name, pos_label=1):
     precision   = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     f1          = (2 * precision * sensitivity / (precision + sensitivity)
                    if (precision + sensitivity) > 0 else 0.0)
-    roc_auc     = roc_auc_score(y_test, y_prob)
-    fpr, tpr, _ = roc_curve(y_test, y_prob)
+
+    # AUC / ROC with auto-direction correction (matches R's pROC::roc)
+    roc_auc = roc_auc_score(y_test, y_prob)
+    prob_inverted = False
+    if roc_auc < 0.5:
+        prob_inverted = True
+        y_prob_roc = 1.0 - y_prob
+        roc_auc = roc_auc_score(y_test, y_prob_roc)
+        fpr, tpr, _ = roc_curve(y_test, y_prob_roc)
+    else:
+        fpr, tpr, _ = roc_curve(y_test, y_prob)
 
     print(f'\n{"═"*46}')
     print(f'  {name}')
@@ -247,6 +267,9 @@ def evaluate_model(estimator, X_test, y_test, name, pos_label=1):
     print(f'  Precision  : {precision:.4f}')
     print(f'  F1 Score   : {f1:.4f}')
     print(f'  AUC        : {roc_auc:.4f}')
+    if prob_inverted:
+        print(f'  [NOTE] Platt-scaled probabilities were inverted; '
+              f'corrected for AUC/ROC (like R\'s pROC auto-direction).')
 
     return {
         'name': name, 'estimator': estimator,
