@@ -174,3 +174,136 @@ python pipeline/ml_pipeline.py \
 ### ⚠ Data leakage note
 
 Both the statistical tests and Boruta are run on **all 72 subjects** before the cross-validation loop begins. This means the feature selection process has seen the test subjects — a form of data leakage inherited from the original R code. The leakage is mild (feature selection, not model training, sees all data) but means reported CV metrics are slightly optimistic. This is documented here for transparency and replicated faithfully to match the published methodology.
+
+---
+
+## 7. Evaluation Framework
+
+### 7.1 Nested stratified cross-validation
+
+The Python pipeline replaces the R code's single 70/30 hold-out split with a **nested stratified 5 × 5 cross-validation**:
+
+```
+Outer CV (5 folds, random_state=42):
+  ├── Fold 1: train on 58 subjects, test on 14
+  ├── Fold 2: train on 58 subjects, test on 14
+  ├── Fold 3: train on 58 subjects, test on 14
+  ├── Fold 4: train on 58 subjects, test on 14
+  └── Fold 5: train on 58 subjects, test on 14
+         └── Inner CV (5 folds, random_state=fold_idx):
+               HPO for LR, SVM (GridSearchCV), RF, XGB (Optuna TPE)
+```
+
+Key properties:
+- Every one of the 72 subjects appears in the test set **exactly once** (outer CV exhaustive coverage).
+- Every outer and inner split is **stratified**: the ASD/Non-ASD class ratio is preserved in every fold.
+- Inner CV uses `random_state=fold_idx` (0–4), making every fold's HPO independently but deterministically seeded.
+- Final metrics are **mean ± std** across the 5 outer folds, capturing genuine fold-to-fold variability on this small dataset.
+
+This contrasts with the single 70/30 split in `thesis.R`, which produces a single point estimate with no variance quantification and whose result depends heavily on which 22 subjects happen to fall in the test set.
+
+### 7.2 Scaling
+
+Within each outer fold, a `StandardScaler` is fit **on the outer training set only** and applied to both training and test sets. The scaler is part of the sklearn `Pipeline` object, so there is no leakage of test-set statistics into training.
+
+### 7.3 AUC auto-correction
+
+After computing `roc_auc_score`, the pipeline checks:
+
+```python
+if auc < 0.5:
+    y_prob = 1.0 - y_prob   # flip probabilities
+    auc = 1.0 - auc         # report mirror AUC
+```
+
+This mirrors R's `pROC` package default behaviour (`direction="auto"`). It handles cases where a model consistently predicts the wrong class — the sign of discrimination is corrected before reporting. The same correction is applied before constructing ROC curves and before ensembling.
+
+---
+
+## 8. Models
+
+Seven models are evaluated in every outer fold:
+
+| Model | HPO method | Class-imbalance handling |
+|-------|------------|--------------------------|
+| **LR** — Logistic Regression (Elastic Net) | GridSearchCV | `class_weight='balanced'` |
+| **RF** — Random Forest | Optuna TPE | `class_weight='balanced'` |
+| **SVM** — Support Vector Machine (RBF kernel) | GridSearchCV | `class_weight='balanced'` |
+| **LDA** — Linear Discriminant Analysis (Ledoit-Wolf) | None | Estimated class priors |
+| **XGB** — XGBoost | Optuna TPE | `scale_pos_weight = n_neg / n_pos` per outer fold |
+| **Soft-Vote Ensemble** | — | Inherits from base models |
+| **Majority-Vote Ensemble** | — | Inherits from base models |
+
+### 8.1 Logistic Regression (LR)
+
+- Solver: `saga` (handles both L1 and L2 penalties; scales to large datasets)
+- Penalty: `elasticnet` (combination of L1 and L2 regularisation)
+- `max_iter=2000`, `class_weight='balanced'`
+- **HPO (GridSearchCV, 5-fold inner CV):**
+  - `C` ∈ {0.01, 0.1, 1.0, 10.0, 100.0}
+  - `l1_ratio` ∈ {0.0, 0.25, 0.5, 0.75, 1.0}
+  - 25 grid points, scored by AUC
+
+### 8.2 Random Forest (RF)
+
+- 200 trees during Optuna search; 1 000 trees for final fit after HPO
+- `class_weight='balanced'`, `random_state` fixed per fold
+- Wrapped in `CalibratedClassifierCV(cv=3, method='isotonic')` for probability calibration
+- **HPO (Optuna TPE, 50 trials, 5-fold inner CV):**
+  - `max_features` ∈ [0.1, 1.0] (continuous, sampled by Optuna)
+  - `min_samples_leaf` ∈ [1, 20] (integer)
+  - `max_depth` ∈ [3, 30] (integer, None also allowed)
+  - Scored by AUC
+
+### 8.3 SVM (RBF kernel)
+
+- Base: `SVC(kernel='rbf', class_weight='balanced', probability=False)`
+- Wrapped in `CalibratedClassifierCV(cv=3, method='sigmoid')` — provides calibrated probabilities via Platt scaling applied only to the calibration fold, not the full training set
+- **HPO (GridSearchCV, 5-fold inner CV):**
+  - `C` ∈ {0.1, 1.0, 10.0, 100.0, 1000.0}
+  - `gamma` ∈ {'scale', 0.01, 0.1, 1.0}
+  - 20 grid points; param keys route through calibration wrapper (`estimator__C`, `estimator__gamma`)
+  - Scored by AUC
+
+### 8.4 LDA (Ledoit-Wolf)
+
+- `LinearDiscriminantAnalysis(solver='eigen', shrinkage='auto')`
+- Ledoit-Wolf analytical shrinkage automatically regularises the covariance matrix for small-N data — no HPO needed
+- Class priors estimated from training set class frequencies (consistent with `class_weight='balanced'` intent)
+- No probability calibration applied (LDA probabilities are already well-calibrated under the Gaussian assumption)
+
+### 8.5 XGBoost
+
+- `XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=fold_idx)`
+- `scale_pos_weight = n_neg / n_pos` computed from the outer training fold's class counts
+- **HPO (Optuna TPE, 50 trials, 5-fold inner CV):**
+  - `n_estimators` ∈ [50, 500]
+  - `max_depth` ∈ [2, 10]
+  - `learning_rate` ∈ [0.01, 0.3] (log-uniform)
+  - `subsample` ∈ [0.5, 1.0]
+  - `colsample_bytree` ∈ [0.5, 1.0]
+  - `reg_alpha` ∈ [1e-8, 10.0] (log-uniform, L1)
+  - `reg_lambda` ∈ [1e-8, 10.0] (log-uniform, L2)
+  - Scored by AUC
+
+> **Thesis note:** XGBoost is present in `thesis.R` but absent from the published thesis results table. It is included in the Python pipeline as an extension and labelled clearly.
+
+### 8.6 Soft-Vote Ensemble
+
+After all five base models produce AUC-corrected probability arrays `p_1 … p_5` on the outer test fold, the ensemble prediction is:
+
+```
+p_ensemble = (p_1 + p_2 + p_3 + p_4 + p_5) / 5
+```
+
+The ensemble threshold is determined by applying Youden's J (Section 9.2) to the averaged training-set probabilities, ensuring no test-set information is used in threshold selection.
+
+### 8.7 Majority-Vote Ensemble
+
+Each base model's binary prediction (0/1, obtained via its own Youden threshold) is treated as one vote. The subject is predicted ASD if:
+
+```
+votes > n_base / 2   (i.e., strictly more than half the models vote ASD)
+```
+
+With 5 base models, this requires 3 or more votes. The raw vote count (0–5) is used as an ordinal score for AUC computation (with auto-direction correction applied if necessary).
