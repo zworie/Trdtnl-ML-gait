@@ -254,25 +254,15 @@ xgb_grid <- expand.grid(
 )
 cat("XGBoost grid size:", nrow(xgb_grid), "combinations\n")
 
-xgb_model <- tryCatch(
-  train(Class ~ ., data = train_balanced,
-        method    = "xgbTree",
-        trControl = ctrl,
-        tuneGrid  = xgb_grid,
-        metric    = "ROC",
-        verbosity = 0),
-  error = function(e) {
-    cat("[WARN] XGBoost failed:", conditionMessage(e), "\n")
-    NULL
-  }
-)
+xgb_model <- train(Class ~ ., data = train_balanced,
+                   method    = "xgbTree",
+                   trControl = ctrl,
+                   tuneGrid  = xgb_grid,
+                   metric    = "ROC",
+                   nthread   = 1)
 
-if (!is.null(xgb_model)) {
-  cat("Best XGB:\n"); print(xgb_model$bestTune)
-  results_list[["XGB"]] <- eval_model(xgb_model, test_scaled, "XGBoost")
-} else {
-  cat("[INFO] XGBoost skipped — it will not appear in comparison.\n")
-}
+cat("Best XGB:\n"); print(xgb_model$bestTune)
+results_list[["XGB"]] <- eval_model(xgb_model, test_scaled, "XGBoost")
 
 #  14. Stop Cluster 
 stopCluster(cl); registerDoSEQ()
@@ -353,10 +343,9 @@ ggsave("plot_model_comparison_bar.png", p_bar,
 model_objs <- list(
   LR_ElasticNet = lr_model,
   RandomForest  = rf_model,
-  SVM_RBF       = svm_model
+  SVM_RBF       = svm_model,
+  XGBoost       = xgb_model
 )
-if (exists("xgb_model") && !is.null(xgb_model))
-  model_objs[["XGBoost"]] <- xgb_model
 
 resamps <- resamples(model_objs)
 cat("\n=== Cross-Validation ROC Summary ===\n")
