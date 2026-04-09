@@ -115,30 +115,60 @@ python pipeline/ml_pipeline.py
 ```
 
 This runs the full pipeline and saves all outputs to `outputs/`.
-**Expected run time: 20–40 minutes** (RF + XGBoost across 30 seeds are the
-bottleneck).  For a quick test run use:
+**Expected run time: 10–20 minutes** with default settings (RF and XGBoost
+Optuna searches are the bottleneck).  For a quick test run use:
 
 ```bash
-python pipeline/ml_pipeline.py --n-trials 20 --n-seeds 5
+python pipeline/ml_pipeline.py --n-trials 10 --n-outer 3 --n-inner 3
 ```
 
-#### What the improved pipeline does
+#### What the pipeline does
 
-The pipeline uses **nested stratified cross-validation** with **Optuna** instead of a
-single 70/30 split with grid search:
-
-| Component | Original | Improved |
-|-----------|----------|----------|
-| Evaluation | Single 70/30 split → 1 test result | **5-fold outer stratified CV → all 72 subjects evaluated as test → mean ± std** |
-| HPO | GridSearchCV (fixed grid) | **Optuna TPE** on inner stratified 5-fold CV (continuous log-space, 50 trials) |
-| SMOTE | Applied before inner CV (mild leakage) | **Inside each inner fold via ImbPipeline** (no leakage into outer test fold) |
+| Component | Original (thesis.R) | Improved Python pipeline |
+|-----------|---------------------|--------------------------|
+| Evaluation | Single 70/30 split → 1 test result | **Nested 5×5 stratified CV** → all 72 subjects evaluated as test → mean ± std |
 | Stratification | Single stratified split | **Every outer and inner fold is stratified** — class ratio preserved throughout |
-| SVM AUC | Could be < 0.5 from Platt inversion | **Auto-corrected inside Optuna and evaluation** |
+| Models | LR, RF, SVM | **LR, RF, SVM, LDA, XGBoost + Soft-Vote Ensemble** |
+| HPO — LR | GridSearchCV | **GridSearchCV** (6×5 = 30 grid points, C × l1\_ratio) |
+| HPO — SVM | GridSearchCV | **GridSearchCV** (6×5 = 30 grid points, C × gamma) |
+| HPO — RF | GridSearchCV | **Optuna TPE** (3 continuous params, 50 trials) |
+| HPO — XGBoost | GridSearchCV | **Optuna TPE** (7 continuous params, 50 trials) |
+| HPO — LDA | — | **None** — Ledoit-Wolf shrinkage is fully automatic |
+| SMOTE | Applied before CV (mild leakage) | **Inside each inner fold via ImbPipeline** — never touches the outer test fold |
+| SVM AUC | Could be < 0.5 from Platt inversion | **Auto-corrected** in both HPO scoring and evaluation |
 
-The outer loop splits all 72 subjects into 5 stratified folds (~14 test subjects
-each).  Every subject appears as a test subject exactly once.  The inner loop
-tunes hyperparameters on the outer training set (~58 subjects) using a further
-5-fold stratified split.  Class proportions are preserved in every fold.
+#### Models
+
+| Model | HPO method | Notes |
+|-------|-----------|-------|
+| **Logistic Regression** (Elastic Net) | GridSearchCV | Sparse + ridge regularisation combined |
+| **Random Forest** | Optuna TPE | 200 trees during search; 1 000 for final fit |
+| **SVM** (RBF kernel) | GridSearchCV | `probability=True` for AUC scoring |
+| **LDA** (Ledoit-Wolf) | None | Automatic covariance shrinkage; ideal for small N |
+| **XGBoost** | Optuna TPE | Extension beyond published thesis; 7 params |
+| **Soft-Vote Ensemble** | — | Averages AUC-corrected probabilities from all 5 base models |
+
+#### How the nested CV works
+
+The outer loop splits all 72 subjects into 5 **stratified** folds (~14 test
+subjects each).  Every subject appears as a test subject exactly once, and
+the ASD/Non-ASD ratio is preserved in every fold.
+
+For each outer fold, the ~58 training subjects go into the inner loop:
+
+- **LR and SVM**: `GridSearchCV` with a 5-fold stratified inner CV exhaustively
+  evaluates the full parameter grid and refits the winner on the full outer
+  training set.
+- **RF and XGB**: Optuna TPE samples 50 hyperparameter configurations, each
+  evaluated via 5-fold stratified inner CV, then refits the winner on the full
+  outer training set.
+- **LDA**: Fit directly — no tuning needed.
+
+After all five base models are evaluated on the outer test fold, their
+probability scores are averaged to produce the **Ensemble** prediction.
+
+SMOTE runs inside every inner-fold training step via `ImbPipeline`, so
+synthetic samples never contaminate the outer test fold.
 
 #### Anchor to thesis features (skip Boruta)
 
@@ -155,8 +185,8 @@ python pipeline/ml_pipeline.py \
 |------|---------|-------------|
 | `--features` | `gait_features_rich.csv` | Input feature CSV |
 | `--out` | `outputs/` | Output directory |
-| `--selected-features` | *(run Boruta)* | Skip Boruta; use these features |
-| `--n-trials` | `50` | Optuna trials per model per outer fold |
+| `--selected-features` | *(run Boruta)* | Skip Boruta; use these exact feature names |
+| `--n-trials` | `50` | Optuna trials per model per outer fold (RF and XGB only) |
 | `--n-outer` | `5` | Number of outer CV folds |
 | `--n-inner` | `5` | Number of inner CV folds for HPO |
 
@@ -166,13 +196,13 @@ All outputs are saved in `outputs/`:
 
 | File | Description |
 |------|-------------|
-| `model_comparison_results.csv` | **mean ± std** of AUC, Accuracy, Sensitivity, Specificity, F1, Precision across all outer folds |
-| `per_fold_results.csv` | Raw metrics for every individual (fold, model) combination |
+| `model_comparison_results.csv` | **mean ± std** of AUC, Accuracy, Sensitivity, Specificity, F1, Precision across all outer folds — one row per model (6 rows) |
+| `per_fold_results.csv` | Raw metrics for every (fold × model) combination — 5 folds × 6 models = 30 rows |
 | `statistical_test_results.csv` | p-values and test type for all retained features |
-| `plot_sig_features_boxplot.png` | Boxplots of significant features (ASD vs Non-ASD) |
-| `plot_rf_importance.png` | RF feature importance from the fold with the highest RF AUC |
-| `plot_roc_all_models.png` | Mean ROC curves (bold) + individual fold curves (light gray) |
-| `plot_model_comparison_bar.png` | Bar chart of mean AUC per model with ± std error bars |
+| `plot_sig_features_boxplot.png` | Boxplots of statistically significant features (ASD vs Non-ASD) |
+| `plot_rf_importance.png` | RF feature importance (Gini) from the fold with the highest RF AUC |
+| `plot_roc_all_models.png` | Mean ROC curve per model (bold coloured line) + individual fold curves (light grey) |
+| `plot_model_comparison_bar.png` | Bar chart of mean AUC per model with ± 1 std error bars |
 | `plot_auc_distributions.png` | Box plots of per-fold AUC distributions for each model |
 
 ---
@@ -188,29 +218,33 @@ All outputs are saved in `outputs/`:
 | **Sensitivity** | True positive rate for ASD (= recall). High sensitivity → fewer missed ASD cases. |
 | **Specificity** | True positive rate for Non-ASD. High specificity → fewer false alarms. |
 | **F1** | Harmonic mean of precision and recall for the ASD class. Balances both. |
+| **Precision** | Fraction of predicted-ASD subjects that are truly ASD. |
 
 ### Expected range
 
-The published thesis results (R code, single test set):
+The published thesis result (R code, single hold-out test set):
 
 | Model | AUC (thesis R) |
 |-------|----------------|
 | SVM (RBF) | **0.935** |
 
-The improved Python pipeline uses nested CV with a different evaluation
-framework, so direct numerical comparison with the thesis is not meaningful.
-Expect mean AUC values in the 0.70–0.95 range with std 0.05–0.15 across folds,
-reflecting genuine variability on this 72-subject dataset.
+The Python pipeline uses a different evaluation framework (nested CV vs single
+70/30 split) and different implementations, so direct numerical comparison is
+not meaningful.  Expect mean AUC values in the **0.70–0.95 range** with
+std 0.05–0.15, reflecting genuine variability on this 72-subject dataset.
+The Ensemble and LDA models often match or exceed individual model AUC on
+small datasets.
 
 ### Stochasticity and reproducibility
 
 The outer CV uses `random_state=42`.  Each inner CV uses `random_state=fold_idx`
-so every fold's hyperparameter search is independently seeded and reproducible.
-Results are fully reproducible across runs on the same machine and library version.
+(0–4) so every fold's hyperparameter search is independently seeded.
+Optuna studies are seeded from `fold_idx`.  Results are fully reproducible
+across runs on the same machine and library version.
 
 ---
 
-## Custom Paths
+## Custom Paths and Examples
 
 ```bash
 # Feature extraction with custom input/output paths
@@ -222,14 +256,19 @@ python pipeline/feature_extraction.py \
 # Verify against the ground-truth CSV
 python pipeline/feature_extraction.py --verify
 
-# ML pipeline — fast test run (5 outer folds, 3 inner folds, 20 Optuna trials)
-python pipeline/ml_pipeline.py --n-trials 20 --n-outer 5 --n-inner 3
+# ML pipeline — quick test (3 outer folds, 3 inner folds, 10 Optuna trials)
+python pipeline/ml_pipeline.py --n-trials 10 --n-outer 3 --n-inner 3
 
-# ML pipeline with thesis features and full settings
+# ML pipeline with thesis features (skip Boruta) and full default settings
+python pipeline/ml_pipeline.py \
+    --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt \
+                        LDP_cv TrunkY_max CoM_Y_min StepLength
+
+# ML pipeline with thesis features and more Optuna trials
 python pipeline/ml_pipeline.py \
     --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt \
                         LDP_cv TrunkY_max CoM_Y_min StepLength \
-    --n-trials 50 --n-outer 5 --n-inner 5
+    --n-trials 100 --n-outer 5 --n-inner 5
 ```
 
 ---
@@ -238,4 +277,5 @@ python pipeline/ml_pipeline.py \
 
 - The `outputs/` directory is listed in `.gitignore` and is not committed to the repository. Regenerate it by running the pipeline.
 - The `venv/` directory is also excluded from git.
+- Boruta feature selection runs on the full 72-subject dataset before the CV loop (a data-leakage limitation inherited from the original R code; documented in `FINDINGS.md`).  Use `--selected-features` to bypass Boruta entirely and anchor the pipeline to the 8 thesis-confirmed features.
 - For details on methodological discrepancies between the thesis and the code, see `FINDINGS.md`.
