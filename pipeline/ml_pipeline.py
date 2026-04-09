@@ -47,7 +47,6 @@ Usage
 import argparse
 import json
 import os
-import sys
 import warnings
 
 import matplotlib
@@ -55,7 +54,6 @@ matplotlib.use('Agg')  # non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -286,37 +284,30 @@ def plot_sig_boxplots(df, sig_feats, out_path):
 # =============================================================================
 
 def suggest_params(trial, model_key):
-    """Return a dict of model parameters suggested by the Optuna trial."""
-    if model_key == 'LR':
+    """Return Optuna-suggested params for RF or XGB.
+    LR and SVM use GridSearchCV and do not call this function.
+    LDA has no hyperparameters and does not call this function.
+    """
+    if model_key == 'RF':
         return {
-            'C':        trial.suggest_float('C', 1e-3, 1e3, log=True),
-            'l1_ratio': trial.suggest_float('l1_ratio', 0.0, 1.0),
-        }
-    elif model_key == 'RF':
-        return {
-            'max_features':       trial.suggest_float('max_features', 0.1, 1.0),
-            'min_samples_leaf':   trial.suggest_int('min_samples_leaf', 1, 15),
-            'max_depth':          trial.suggest_int('max_depth', 3, 20),
+            'max_features':     trial.suggest_float('max_features', 0.1, 1.0),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 1, 15),
+            'max_depth':        trial.suggest_int('max_depth', 3, 20),
             # n_estimators fixed at 200 during search, bumped to 1000 for final fit
             'n_estimators': 200,
         }
-    elif model_key == 'SVM':
-        return {
-            'C':     trial.suggest_float('C', 1e-3, 1e2, log=True),
-            'gamma': trial.suggest_float('gamma', 1e-4, 1e1, log=True),
-        }
     elif model_key == 'XGB':
         return {
-            'n_estimators':    trial.suggest_int('n_estimators', 50, 300),
-            'max_depth':       trial.suggest_int('max_depth', 2, 8),
-            'learning_rate':   trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-            'subsample':       trial.suggest_float('subsample', 0.5, 1.0),
+            'n_estimators':     trial.suggest_int('n_estimators', 50, 300),
+            'max_depth':        trial.suggest_int('max_depth', 2, 8),
+            'learning_rate':    trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            'subsample':        trial.suggest_float('subsample', 0.5, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-            'reg_alpha':       trial.suggest_float('reg_alpha', 1e-4, 1.0, log=True),
-            'reg_lambda':      trial.suggest_float('reg_lambda', 1e-4, 1.0, log=True),
+            'reg_alpha':        trial.suggest_float('reg_alpha', 1e-4, 1.0, log=True),
+            'reg_lambda':       trial.suggest_float('reg_lambda', 1e-4, 1.0, log=True),
         }
     else:
-        raise ValueError(f'Unknown model_key: {model_key}')
+        raise ValueError(f'suggest_params called for {model_key} — only RF/XGB use Optuna')
 
 
 def build_pipe(model_key, params, rng=42):
@@ -527,7 +518,7 @@ def plot_auc_distributions(model_aucs, model_keys, out_path):
     ax.set_xticks(np.arange(1, len(names) + 1))
     ax.set_xticklabels(names, rotation=15, ha='right', fontsize=9)
     ax.set_ylabel('AUC')
-    ax.set_title('Per-seed AUC Distribution by Model')
+    ax.set_title('Per-fold AUC Distribution by Model')
     ax.axhline(0.5, color='grey', linestyle='--', lw=1)
     plt.tight_layout()
     plt.savefig(out_path, dpi=130, bbox_inches='tight')
