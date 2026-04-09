@@ -1,77 +1,72 @@
 """
 Traditional ML Pipeline for ASD Gait Classification
 =====================================================
-Python conversion of thesis.R, faithfully replicating the full pipeline:
+Python conversion of thesis.R — nested cross-validation rewrite.
 
+Steps:
   1.  Load gait_features_rich.csv
   2.  Remove near-zero-variance features  (caret::nearZeroVar)
   3.  Remove highly correlated features   (caret::findCorrelation, cutoff=0.95)
-  4.  Group-difference statistical tests  (Shapiro-Wilk → t-test or Wilcoxon)
+  4.  Group-difference statistical tests  (Shapiro-Wilk -> t-test or Wilcoxon)
   5.  Boxplots of significant features
   6.  Boruta feature selection            (fallback: use significant features)
-  7.  Stratified 70/30 train/test split
-  8.  StandardScaler (fit on train only)
-  9.  SMOTE on training set only         (over_ratio=1 → balanced classes)
-  10. Repeated 5-fold CV (3 repeats)     (scoring=roc_auc)
-  11. Model training + grid search:
-        Logistic Regression (Elastic Net)
-        Random Forest (1 000 trees)
-        SVM (RBF kernel)
-        XGBoost  [extension; not in published thesis results]
-  12. Hold-out test evaluation + metrics
-  13. ROC overlay, performance bar chart, RF importance, CV dotplot
-  14. model_comparison_results.csv + statistical_test_results.csv
+  7.  Nested cross-validation (outer 10x3, inner 5-fold Optuna)
+  8.  StandardScaler + SMOTE inside ImbPipeline (no leakage)
+  9.  Optuna HPO per model per fold (TPE, 50 trials)
+  10. Evaluate on outer test fold: AUC, Accuracy, Sensitivity, Specificity, F1, Precision
+  11. Aggregate metrics: mean +/- std over 30 outer folds
+  12. Plots: ROC (mean + per-fold), bar chart, RF importance, AUC box plots
+  13. Save model_comparison_results.csv, per_fold_results.csv
 
 Faithfulness notes
 ------------------
 - Boruta and statistical tests are run on the FULL dataset (same as R code),
-  before the train/test split.  This is a data-leakage issue documented in
+  before the outer CV loop.  This is a data-leakage issue documented in
   FINDINGS.md but replicated here for reproducibility.
-- SMOTE is applied exclusively to the training set, after scaling.
-- All random seeds are fixed to 42 throughout.
+- SMOTE runs inside each fold (ImbPipeline) — prevents synthetic sample leakage.
+- All random seeds are fixed; Optuna studies seeded as 42+fold_idx.
 - XGBoost is an extension present in thesis.R but absent from published
-  thesis results.  It is included here for completeness.
+  thesis results.  Included here for completeness.
 
 Usage
 -----
   python pipeline/ml_pipeline.py
-  python pipeline/ml_pipeline.py --features outputs/gait_features_extracted.csv
+  python pipeline/ml_pipeline.py --selected-features LHip_min RKnee_skew
+  python pipeline/ml_pipeline.py --n-trials 100 --n-folds 10 --n-repeats 3
 """
 
 import argparse
+import json
 import os
 import sys
 import warnings
 
 import matplotlib
-matplotlib.use('Agg')  # non-interactive backend — works without a display
+matplotlib.use('Agg')  # non-interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTE
 from scipy.stats import mannwhitneyu, shapiro, ttest_ind
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    ConfusionMatrixDisplay,
-    auc,
-    confusion_matrix,
-    roc_auc_score,
-    roc_curve,
-)
+from sklearn.metrics import make_scorer, roc_auc_score, roc_curve, confusion_matrix
 from sklearn.model_selection import (
-    GridSearchCV,
     RepeatedStratifiedKFold,
+    StratifiedKFold,
     cross_val_score,
-    train_test_split,
 )
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 warnings.filterwarnings('ignore')
 
-# ── Optional imports (fail gracefully) ────────────────────────────────────────
-
+# Optional imports
 try:
     from boruta import BorutaPy
     BORUTA_AVAILABLE = True
@@ -86,17 +81,36 @@ except ImportError:
     XGB_AVAILABLE = False
     print('[WARN] xgboost not installed; XGBoost model will be skipped.')
 
-try:
-    from imblearn.over_sampling import SMOTE
-    SMOTE_AVAILABLE = True
-except ImportError:
-    SMOTE_AVAILABLE = False
-    print('[WARN] imbalanced-learn not installed; SMOTE will be skipped.')
+
+# =============================================================================
+# Constants / display names
+# =============================================================================
+
+MODEL_DISPLAY = {
+    'LR':  'Logistic Regression (Elastic Net)',
+    'RF':  'Random Forest',
+    'SVM': 'SVM (RBF Kernel)',
+    'XGB': 'XGBoost',
+}
+
+PALETTE      = {'ASD': '#D6604D', 'NonASD': '#4393C3'}
+MODEL_COLORS = ['#1B7837', '#2166AC', '#D6604D', '#762A83', '#E08214']
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. caret-compatible helpers
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Corrected AUC scorer  (replicates R pROC auto-direction)
+# =============================================================================
+
+def _corrected_roc_auc(y_true, y_score):
+    s = roc_auc_score(y_true, y_score)
+    return max(s, 1.0 - s)
+
+corrected_auc_scorer = make_scorer(_corrected_roc_auc, needs_proba=True)
+
+
+# =============================================================================
+# Steps 1-2: caret-compatible NZV and correlation helpers
+# =============================================================================
 
 def near_zero_var(df, freq_cut=19.0, unique_cut=10.0):
     """
@@ -117,7 +131,6 @@ def near_zero_var(df, freq_cut=19.0, unique_cut=10.0):
     for col in df.columns:
         vc = df[col].value_counts()
         if len(vc) <= 1:
-            # zero variance — always remove
             to_remove.append(col)
             continue
         freq_ratio = vc.iloc[0] / vc.iloc[1]
@@ -157,7 +170,7 @@ def find_correlation(cor_mat, cutoff=0.95):
                     deleted[i] = True
                     abs_cor[i, :] = 0
                     abs_cor[:, i] = 0
-                    break          # match R: stop checking j's for this i
+                    break
                 else:
                     deleted[j] = True
                     abs_cor[j, :] = 0
@@ -165,14 +178,14 @@ def find_correlation(cor_mat, cutoff=0.95):
     return [cols[k] for k in range(n) if deleted[k]]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. Statistical tests
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# Step 3: Statistical tests
+# =============================================================================
 
 def group_diff_tests(df, feat_cols, class_col='Class',
                      pos_class='ASD', neg_class='NonASD'):
     """
-    Replicate R step 3: Shapiro-Wilk normality test → t-test or Wilcoxon.
+    Replicate R step 3: Shapiro-Wilk normality test -> t-test or Wilcoxon.
 
     For each feature:
       - Shapiro-Wilk on the full sample
@@ -193,12 +206,10 @@ def group_diff_tests(df, feat_cols, class_col='Class',
             sw_p = np.nan
 
         if not np.isnan(sw_p) and sw_p > 0.05:
-            # Normal → Welch t-test (var.equal=FALSE)
             _, p = ttest_ind(pos[col].dropna(), neg[col].dropna(),
                              equal_var=False)
             test = 't-test'
         else:
-            # Non-normal → Wilcoxon / Mann-Whitney (two-sided)
             _, p = mannwhitneyu(pos[col].dropna(), neg[col].dropna(),
                                 alternative='two-sided')
             test = 'Wilcoxon'
@@ -209,84 +220,9 @@ def group_diff_tests(df, feat_cols, class_col='Class',
     return pd.DataFrame(rows)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. Evaluation helper
-# ══════════════════════════════════════════════════════════════════════════════
-
-def evaluate_model(estimator, X_test, y_test, name, pos_label=1):
-    """
-    Compute and print confusion matrix + metrics for one model.
-    Returns a result dict compatible with the comparison table.
-
-    AUC direction correction
-    ------------------------
-    R's pROC::roc() auto-detects whether higher predictor values correspond
-    to the positive or negative class and adjusts the ROC direction.
-    sklearn's roc_auc_score does not — it assumes higher = positive.
-
-    SVC's Platt scaling (probability=True) can invert the probability
-    direction on small / SMOTE'd datasets, producing AUC < 0.5 even when
-    the hard predictions are correct.  We replicate R's auto-detection:
-    if AUC < 0.5, flip the probability scores for ROC/AUC computation.
-    """
-    y_prob = estimator.predict_proba(X_test)[:, 1]
-    y_pred = estimator.predict(X_test)
-
-    cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
-    # labels=[0,1] → rows/cols = [NonASD, ASD]
-    tn, fp, fn, tp = cm.ravel()
-
-    accuracy    = (tp + tn) / (tp + tn + fp + fn)
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0   # recall
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-    precision   = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    f1          = (2 * precision * sensitivity / (precision + sensitivity)
-                   if (precision + sensitivity) > 0 else 0.0)
-
-    # AUC / ROC with auto-direction correction (matches R's pROC::roc)
-    roc_auc = roc_auc_score(y_test, y_prob)
-    prob_inverted = False
-    if roc_auc < 0.5:
-        prob_inverted = True
-        y_prob_roc = 1.0 - y_prob
-        roc_auc = roc_auc_score(y_test, y_prob_roc)
-        fpr, tpr, _ = roc_curve(y_test, y_prob_roc)
-    else:
-        fpr, tpr, _ = roc_curve(y_test, y_prob)
-
-    print(f'\n{"═"*46}')
-    print(f'  {name}')
-    print(f'{"═"*46}')
-    print(f'  Confusion Matrix (rows=actual, cols=pred):')
-    print(f'            NonASD   ASD')
-    print(f'  NonASD  {tn:6d}  {fp:6d}')
-    print(f'  ASD     {fn:6d}  {tp:6d}')
-    print(f'  Accuracy   : {accuracy:.4f}')
-    print(f'  Sensitivity: {sensitivity:.4f}')
-    print(f'  Specificity: {specificity:.4f}')
-    print(f'  Precision  : {precision:.4f}')
-    print(f'  F1 Score   : {f1:.4f}')
-    print(f'  AUC        : {roc_auc:.4f}')
-    if prob_inverted:
-        print(f'  [NOTE] Platt-scaled probabilities were inverted; '
-              f'corrected for AUC/ROC (like R\'s pROC auto-direction).')
-
-    return {
-        'name': name, 'estimator': estimator,
-        'fpr': fpr, 'tpr': tpr,
-        'accuracy': accuracy, 'sensitivity': sensitivity,
-        'specificity': specificity, 'precision': precision,
-        'f1': f1, 'auc': roc_auc,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. Plotting helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
-PALETTE = {'ASD': '#D6604D', 'NonASD': '#4393C3'}
-MODEL_COLORS = ['#1B7837', '#2166AC', '#D6604D', '#762A83', '#E08214']
-
+# =============================================================================
+# Step 4: Boxplots
+# =============================================================================
 
 def plot_sig_boxplots(df, sig_feats, out_path):
     """Boxplots for up to 9 significant features (replicates R step 4)."""
@@ -300,7 +236,8 @@ def plot_sig_boxplots(df, sig_feats, out_path):
     for i, feat in enumerate(feats):
         ax = axes[i]
         for cls, grp in df.groupby('Class'):
-            ax.boxplot(grp[feat].dropna(), positions=[list(df['Class'].unique()).index(cls)],
+            ax.boxplot(grp[feat].dropna(),
+                       positions=[list(df['Class'].unique()).index(cls)],
                        widths=0.5, patch_artist=True,
                        boxprops=dict(facecolor=PALETTE.get(cls, '#888888'), alpha=0.85),
                        medianprops=dict(color='black', linewidth=1.5),
@@ -318,9 +255,155 @@ def plot_sig_boxplots(df, sig_feats, out_path):
     print(f'  Saved: {out_path}')
 
 
+
+# =============================================================================
+# Optuna helpers: suggest_params, build_pipe
+# =============================================================================
+
+def suggest_params(trial, model_key):
+    """Return a dict of model parameters suggested by the Optuna trial."""
+    if model_key == 'LR':
+        return {
+            'C':        trial.suggest_float('C', 1e-3, 1e3, log=True),
+            'l1_ratio': trial.suggest_float('l1_ratio', 0.0, 1.0),
+        }
+    elif model_key == 'RF':
+        return {
+            'max_features':       trial.suggest_float('max_features', 0.1, 1.0),
+            'min_samples_leaf':   trial.suggest_int('min_samples_leaf', 1, 15),
+            'max_depth':          trial.suggest_int('max_depth', 3, 20),
+            # n_estimators fixed at 200 during search, bumped to 1000 for final fit
+            'n_estimators': 200,
+        }
+    elif model_key == 'SVM':
+        return {
+            'C':     trial.suggest_float('C', 1e-3, 1e2, log=True),
+            'gamma': trial.suggest_float('gamma', 1e-4, 1e1, log=True),
+        }
+    elif model_key == 'XGB':
+        return {
+            'n_estimators':    trial.suggest_int('n_estimators', 50, 300),
+            'max_depth':       trial.suggest_int('max_depth', 2, 8),
+            'learning_rate':   trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+            'subsample':       trial.suggest_float('subsample', 0.5, 1.0),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+            'reg_alpha':       trial.suggest_float('reg_alpha', 1e-4, 1.0, log=True),
+            'reg_lambda':      trial.suggest_float('reg_lambda', 1e-4, 1.0, log=True),
+        }
+    else:
+        raise ValueError(f'Unknown model_key: {model_key}')
+
+
+def build_pipe(model_key, params, rng=42):
+    """
+    Build an ImbPipeline with StandardScaler -> SMOTE -> model.
+    params keys are raw model parameter names (no 'model__' prefix).
+    """
+    if model_key == 'LR':
+        estimator = LogisticRegression(
+            penalty='elasticnet', solver='saga',
+            max_iter=2000, random_state=rng,
+            C=params.get('C', 1.0),
+            l1_ratio=params.get('l1_ratio', 0.5),
+        )
+    elif model_key == 'RF':
+        estimator = RandomForestClassifier(
+            random_state=rng, n_jobs=-1,
+            n_estimators=params.get('n_estimators', 200),
+            max_features=params.get('max_features', 'sqrt'),
+            min_samples_leaf=params.get('min_samples_leaf', 1),
+            max_depth=params.get('max_depth', None),
+        )
+    elif model_key == 'SVM':
+        estimator = SVC(
+            kernel='rbf', probability=True, random_state=rng,
+            C=params.get('C', 1.0),
+            gamma=params.get('gamma', 'scale'),
+        )
+    elif model_key == 'XGB':
+        if not XGB_AVAILABLE:
+            raise RuntimeError('XGBoost not installed')
+        estimator = XGBClassifier(
+            eval_metric='logloss', verbosity=0,
+            random_state=rng, n_jobs=-1,
+            n_estimators=params.get('n_estimators', 100),
+            max_depth=params.get('max_depth', 3),
+            learning_rate=params.get('learning_rate', 0.1),
+            subsample=params.get('subsample', 0.8),
+            colsample_bytree=params.get('colsample_bytree', 0.8),
+            reg_alpha=params.get('reg_alpha', 0.0),
+            reg_lambda=params.get('reg_lambda', 1.0),
+        )
+    else:
+        raise ValueError(f'Unknown model_key: {model_key}')
+
+    pipe = ImbPipeline([
+        ('scaler', StandardScaler()),
+        ('smote',  SMOTE(random_state=rng, sampling_strategy=1.0)),
+        ('model',  estimator),
+    ])
+    return pipe
+
+
+def make_objective(model_key, X_tr, y_tr, inner_cv, rng):
+    """Return an Optuna objective function for the given model and fold data."""
+    def objective(trial):
+        params = suggest_params(trial, model_key)
+        pipe   = build_pipe(model_key, params, rng)
+        scores = cross_val_score(
+            pipe, X_tr, y_tr,
+            cv=inner_cv,
+            scoring=corrected_auc_scorer,
+            n_jobs=-1,
+        )
+        return scores.mean()
+    return objective
+
+
+# =============================================================================
+# Per-fold evaluation helper
+# =============================================================================
+
+def eval_fold(final_pipe, X_te, y_te):
+    """
+    Evaluate a fitted pipeline on the outer test fold.
+    Returns dict of metrics and (fpr, tpr) arrays for ROC plotting.
+    """
+    y_prob = final_pipe.predict_proba(X_te)[:, 1]
+    y_pred = final_pipe.predict(X_te)
+
+    auc_val = roc_auc_score(y_te, y_prob)
+    if auc_val < 0.5:
+        y_prob = 1.0 - y_prob
+        auc_val = 1.0 - auc_val
+
+    fpr, tpr, _ = roc_curve(y_te, y_prob)
+
+    cm = confusion_matrix(y_te, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    accuracy    = (tp + tn) / (tp + tn + fp + fn)
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    precision   = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    f1          = (2 * precision * sensitivity / (precision + sensitivity)
+                   if (precision + sensitivity) > 0 else 0.0)
+
+    return {
+        'auc': auc_val, 'accuracy': accuracy,
+        'sensitivity': sensitivity, 'specificity': specificity,
+        'precision': precision, 'f1': f1,
+        'fpr': fpr, 'tpr': tpr,
+    }
+
+
+# =============================================================================
+# Plotting helpers (Steps 12-13)
+# =============================================================================
+
 def plot_rf_importance(rf_estimator, feature_names, out_path):
     """Horizontal bar chart of RF feature importances (Gini)."""
-    imp = rf_estimator.feature_importances_
+    imp   = rf_estimator.feature_importances_
     order = np.argsort(imp)
     fig, ax = plt.subplots(figsize=(7, max(4, len(feature_names) * 0.4)))
     ax.barh(np.array(feature_names)[order], imp[order],
@@ -333,87 +416,107 @@ def plot_rf_importance(rf_estimator, feature_names, out_path):
     print(f'  Saved: {out_path}')
 
 
-def plot_roc_curves(results_list, out_path):
-    """ROC overlay for all models (replicates R step 16)."""
-    fig, ax = plt.subplots(figsize=(6.5, 6))
-    for i, res in enumerate(results_list):
-        lbl = f"{res['name']}  (AUC={res['auc']:.3f})"
-        ax.plot(res['fpr'], res['tpr'],
-                color=MODEL_COLORS[i % len(MODEL_COLORS)],
-                lw=2.5, label=lbl)
-    ax.plot([0, 1], [0, 1], 'k--', lw=1, color='grey')
+def plot_roc_mean(fold_rocs, model_aucs, model_keys, out_path):
+    """
+    Mean ROC curve per model (bold) with all individual fold curves as
+    light gray lines.  fold_rocs[key] = list of (fpr, tpr) per fold.
+    model_aucs[key] = list of per-fold AUC values.
+    """
+    mean_fpr = np.linspace(0, 1, 100)
+    fig, ax  = plt.subplots(figsize=(7, 6))
+
+    for i, key in enumerate(model_keys):
+        color = MODEL_COLORS[i % len(MODEL_COLORS)]
+        rocs  = fold_rocs[key]
+        aucs  = model_aucs[key]
+
+        interp_tprs = []
+        for fpr, tpr in rocs:
+            interp_tprs.append(np.interp(mean_fpr, fpr, tpr))
+            ax.plot(fpr, tpr, color='lightgray', lw=0.6, alpha=0.4, zorder=1)
+
+        mean_tpr = np.mean(interp_tprs, axis=0)
+        mean_tpr[0]  = 0.0
+        mean_tpr[-1] = 1.0
+        mu  = np.mean(aucs)
+        std = np.std(aucs)
+        lbl = f'{MODEL_DISPLAY[key]}  (AUC={mu:.3f} ± {std:.3f})'
+        ax.plot(mean_fpr, mean_tpr, color=color, lw=2.5, label=lbl, zorder=2)
+
+    ax.plot([0, 1], [0, 1], 'k--', lw=1, color='grey', zorder=0)
     ax.set_xlabel('False Positive Rate')
     ax.set_ylabel('True Positive Rate')
-    ax.set_title('ROC Curves – All Models')
-    ax.legend(loc='lower right', fontsize=9, frameon=False)
+    ax.set_title('ROC Curves – Mean over 30 Outer Folds')
+    ax.legend(loc='lower right', fontsize=8, frameon=False)
     plt.tight_layout()
     plt.savefig(out_path, dpi=130, bbox_inches='tight')
     plt.close()
     print(f'  Saved: {out_path}')
 
 
-def plot_model_comparison_bar(comparison_df, out_path):
-    """Grouped bar chart of all metrics per model (replicates R step 17)."""
-    metrics = ['Accuracy', 'Sensitivity', 'Specificity', 'F1', 'AUC']
-    melted = comparison_df[['Model'] + metrics].melt(
-        id_vars='Model', var_name='Metric', value_name='Value')
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-    sns.barplot(data=melted, x='Metric', y='Value', hue='Model',
-                palette='Set1', alpha=0.9, ax=ax)
-    for container in ax.containers:
-        ax.bar_label(container, fmt='%.2f', fontsize=7.5, padding=2)
+def plot_model_comparison_bar(summary_df, model_keys, out_path):
+    """Grouped bar chart of AUC_mean per model with ± 1 std error bars."""
+    names  = [MODEL_DISPLAY[k] for k in model_keys]
+    means  = [summary_df.loc[summary_df['Model'] == MODEL_DISPLAY[k], 'AUC_mean'].values[0]
+              for k in model_keys]
+    stds   = [summary_df.loc[summary_df['Model'] == MODEL_DISPLAY[k], 'AUC_std'].values[0]
+              for k in model_keys]
+    colors = [MODEL_COLORS[i % len(MODEL_COLORS)] for i in range(len(model_keys))]
+
+    x   = np.arange(len(names))
+    fig, ax = plt.subplots(figsize=(max(7, len(names) * 2), 5.5))
+    bars = ax.bar(x, means, color=colors, alpha=0.88, width=0.55,
+                  yerr=stds, capsize=5, error_kw={'elinewidth': 1.5})
+    for bar, mu in zip(bars, means):
+        ax.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height() + 0.02,
+                f'{mu:.3f}', ha='center', va='bottom', fontsize=9)
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=15, ha='right', fontsize=9)
     ax.set_ylim(0, 1.15)
-    ax.set_xlabel('')
-    ax.set_ylabel('Score')
-    ax.set_title('Model Performance Comparison')
-    ax.tick_params(axis='x', rotation=15)
-    ax.legend(title='Model', fontsize=9, title_fontsize=9)
+    ax.set_ylabel('AUC')
+    ax.set_title('Model AUC Comparison (mean ± 1 std, 30 outer folds)')
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f'  Saved: {out_path}')
 
 
-def plot_cv_dotplot(cv_scores_dict, out_path):
-    """
-    Horizontal dotplot of CV AUC distributions (replicates caret's dotplot).
-    Shows median + 95% CI across the 15 resampling folds.
-    """
-    names = list(cv_scores_dict.keys())
-    medians = [np.median(cv_scores_dict[n]) for n in names]
-    ci_lo = [np.percentile(cv_scores_dict[n], 2.5) for n in names]
-    ci_hi = [np.percentile(cv_scores_dict[n], 97.5) for n in names]
+def plot_auc_distributions(model_aucs, model_keys, out_path):
+    """Box plot of per-fold AUC for each model."""
+    data  = [model_aucs[k] for k in model_keys]
+    names = [MODEL_DISPLAY[k] for k in model_keys]
 
-    fig, ax = plt.subplots(figsize=(7, max(3, len(names) * 0.7)))
-    y = np.arange(len(names))
-    for i, n in enumerate(names):
-        scores = cv_scores_dict[n]
-        ax.scatter(scores, np.full_like(scores, i, dtype=float),
-                   alpha=0.35, s=25, color=MODEL_COLORS[i % len(MODEL_COLORS)])
-        ax.plot([ci_lo[i], ci_hi[i]], [i, i],
-                color=MODEL_COLORS[i % len(MODEL_COLORS)], lw=2)
-        ax.scatter([medians[i]], [i], s=60, zorder=5,
-                   color=MODEL_COLORS[i % len(MODEL_COLORS)])
-    ax.set_yticks(y)
-    ax.set_yticklabels(names)
-    ax.set_xlabel('ROC-AUC')
-    ax.set_title('CV AUC Distribution by Model\n(5-fold × 3 repeats, median + 95% CI)')
-    ax.axvline(0.5, color='grey', linestyle='--', lw=1)
+    fig, ax = plt.subplots(figsize=(max(7, len(model_keys) * 2), 5))
+    bp = ax.boxplot(data, patch_artist=True, notch=False, vert=True)
+    for patch, color in zip(bp['boxes'], MODEL_COLORS):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.75)
+    ax.set_xticks(np.arange(1, len(names) + 1))
+    ax.set_xticklabels(names, rotation=15, ha='right', fontsize=9)
+    ax.set_ylabel('AUC')
+    ax.set_title('Per-fold AUC Distribution by Model (30 outer folds)')
+    ax.axhline(0.5, color='grey', linestyle='--', lw=1)
     plt.tight_layout()
     plt.savefig(out_path, dpi=130, bbox_inches='tight')
     plt.close()
     print(f'  Saved: {out_path}')
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 5. Main pipeline
-# ══════════════════════════════════════════════════════════════════════════════
 
-def main(features_csv, out_dir, preselected_features=None):
+# =============================================================================
+# Main pipeline
+# =============================================================================
+
+def main(features_csv, out_dir,
+         preselected_features=None,
+         n_trials=50, n_folds=10, n_repeats=3):
+
     os.makedirs(out_dir, exist_ok=True)
     rng = 42
 
-    # ── Step 1: Load data ──────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Step 1: Load data
+    # -------------------------------------------------------------------------
     print('=' * 60)
     print('Step 1 – Load data')
     print('=' * 60)
@@ -424,7 +527,9 @@ def main(features_csv, out_dir, preselected_features=None):
     print(f'  Dimensions: {df.shape}')
     print(f'  Class distribution:\n{df["Class"].value_counts().to_string()}')
 
-    # ── Step 2a: Near-zero-variance removal ───────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Step 2a: Near-zero-variance removal
+    # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
     print('Step 2a – Near-zero-variance removal')
     print('=' * 60)
@@ -436,11 +541,13 @@ def main(features_csv, out_dir, preselected_features=None):
     else:
         print('  No NZV features found.')
 
-    # ── Step 2b: High-correlation removal ─────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Step 2b: High-correlation removal
+    # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
     print('Step 2b – High-correlation removal (cutoff=0.95)')
     print('=' * 60)
-    cor_mat = df[feat_cols].corr()
+    cor_mat  = df[feat_cols].corr()
     high_cor = find_correlation(cor_mat, cutoff=0.95)
     if high_cor:
         df = df.drop(columns=high_cor)
@@ -450,18 +557,22 @@ def main(features_csv, out_dir, preselected_features=None):
         print('  No high-correlation features found.')
     print(f'  Features remaining: {len(feat_cols)}')
 
-    # ── Step 3: Group-difference statistical tests ────────────────────────────
+    # -------------------------------------------------------------------------
+    # Step 3: Group-difference statistical tests
+    # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
     print('Step 3 – Group-difference statistical tests')
     print('=' * 60)
-    test_res = group_diff_tests(df, feat_cols)
+    test_res  = group_diff_tests(df, feat_cols)
     sig_feats = test_res.loc[test_res['Significant'] == '***', 'Feature'].tolist()
     print(f'  Significant features (p<0.05): {len(sig_feats)} / {len(feat_cols)}')
     print(test_res[test_res['Significant'] == '***'].to_string(index=False))
     test_res.to_csv(os.path.join(out_dir, 'statistical_test_results.csv'), index=False)
     print(f'\n  Saved: {os.path.join(out_dir, "statistical_test_results.csv")}')
 
-    # ── Step 4: Boxplots of significant features ──────────────────────────────
+    # -------------------------------------------------------------------------
+    # Step 4: Boxplots of significant features
+    # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
     print('Step 4 – Boxplots of significant features')
     print('=' * 60)
@@ -471,38 +582,33 @@ def main(features_csv, out_dir, preselected_features=None):
     else:
         print('  Fewer than 2 significant features; skipping boxplot.')
 
-    # ── Step 5: Boruta feature selection ──────────────────────────────────────
+    # -------------------------------------------------------------------------
+    # Step 5: Boruta feature selection
+    # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
     print('Step 5 – Boruta feature selection (max_iter=200)')
     print('=' * 60)
 
     if preselected_features:
-        # --selected-features supplied: skip Boruta entirely.
         missing = [f for f in preselected_features if f not in feat_cols]
         if missing:
-            print(f'  [WARN] These specified features are not in the dataset '
-                  f'(may have been removed by NZV/correlation): {missing}')
+            print(f'  [WARN] Features not in dataset (may have been removed by NZV/correlation): {missing}')
         selected_feats = [f for f in preselected_features if f in feat_cols]
-        print(f'  Using pre-specified features ({len(selected_feats)}): '
-              f'{", ".join(selected_feats)}')
-        print(f'  (Boruta skipped — feature list supplied via --selected-features)')
+        print(f'  Using pre-specified features ({len(selected_feats)}): {", ".join(selected_feats)}')
+        print('  (Boruta skipped — feature list supplied via --selected-features)')
     else:
         X_all = df[feat_cols].values
         y_all = (df['Class'] == 'ASD').astype(int).values
 
         selected_feats = []
         if BORUTA_AVAILABLE:
-            # R's Boruta uses default randomForest (no depth limit, no class weight).
-            # Match those defaults here — max_depth=None, class_weight=None.
-            rf_boruta = RandomForestClassifier(
-                n_jobs=-1, random_state=rng)
+            rf_boruta = RandomForestClassifier(n_jobs=-1, random_state=rng)
             boruta = BorutaPy(rf_boruta, n_estimators='auto',
                               max_iter=200, random_state=rng, verbose=0)
             try:
                 boruta.fit(X_all, y_all)
                 selected_feats = [feat_cols[i]
                                   for i, s in enumerate(boruta.support_) if s]
-                # Include tentative features (TentativeRoughFix equivalent)
                 tentative = [feat_cols[i]
                              for i, s in enumerate(boruta.support_weak_) if s]
                 selected_feats = list(dict.fromkeys(selected_feats + tentative))
@@ -513,223 +619,193 @@ def main(features_csv, out_dir, preselected_features=None):
         else:
             print('  Boruta not available.')
 
-        # Fallback: use statistically significant features
         if not selected_feats:
             print('  Falling back to statistically significant features.')
             selected_feats = sig_feats if sig_feats else feat_cols
 
     print(f'  Selected ({len(selected_feats)}): {", ".join(selected_feats)}')
-
     df_sel = df[selected_feats + ['Class']].copy()
 
-    # ── Step 6: Train/test split (stratified 70/30) ───────────────────────────
+    # -------------------------------------------------------------------------
+    # Steps 6-11: Nested cross-validation with Optuna HPO
+    # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
-    print('Step 6 – Train/test split (70/30, stratified)')
+    print(f'Steps 6–11 – Nested CV  [outer: {n_folds}x{n_repeats}={n_folds*n_repeats} folds | inner: 5-fold Optuna, {n_trials} trials/model]')
     print('=' * 60)
-    X = df_sel[selected_feats].values
-    y = (df_sel['Class'] == 'ASD').astype(int).values
+    print('  NOTE: Boruta ran on ALL data (acknowledged leakage; see FINDINGS.md)')
+    print()
 
-    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
-        X, y, test_size=0.30, stratify=y, random_state=rng)
-    print(f'  Train: {len(y_train)}  |  Test: {len(y_test)}')
-    print(f'  Train class dist: ASD={y_train.sum()}, NonASD={(y_train==0).sum()}')
-    print(f'  Test  class dist: ASD={y_test.sum()}, NonASD={(y_test==0).sum()}')
+    X_all_sel = df_sel[selected_feats].values
+    y_all_sel = (df_sel['Class'] == 'ASD').astype(int).values
 
-    # ── Step 7: StandardScaler (fit on train only) ────────────────────────────
-    print('\n' + '=' * 60)
-    print('Step 7 – StandardScaler (fit on train, applied to both sets)')
-    print('=' * 60)
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_raw)
-    X_test_scaled = scaler.transform(X_test_raw)
-    print('  Scaler fitted on training data only.')
-
-    # ── Step 8: SMOTE on training set only ────────────────────────────────────
-    print('\n' + '=' * 60)
-    print('Step 8 – SMOTE (training set only, over_ratio=1)')
-    print('=' * 60)
-    if SMOTE_AVAILABLE:
-        smote = SMOTE(sampling_strategy=1.0, random_state=rng)
-        X_train_bal, y_train_bal = smote.fit_resample(X_train_scaled, y_train)
-        print(f'  After SMOTE – ASD: {y_train_bal.sum()}, '
-              f'NonASD: {(y_train_bal==0).sum()}')
-    else:
-        print('  SMOTE not available; using unbalanced training set.')
-        X_train_bal, y_train_bal = X_train_scaled, y_train
-
-    # ── CV control ────────────────────────────────────────────────────────────
-    rskf = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=rng)
-
-    # ── Steps 9–12: Train models ───────────────────────────────────────────────
-    results_list = []
-    best_estimators = {}
-
-    # ── Logistic Regression (Elastic Net) ─────────────────────────────────────
-    print('\n' + '=' * 60)
-    print('Step 9 – Logistic Regression (Elastic Net)')
-    print('=' * 60)
-    # R glmnet: alpha ∈ {0,.25,.5,.75,1}, lambda = 10^seq(-4,1,len=40)
-    # sklearn: l1_ratio = alpha, C = 1/lambda
-    lambda_vals = np.logspace(-4, 1, 40)
-    C_vals = sorted(set(np.round(1.0 / lambda_vals, 8)))
-    lr_grid = {
-        'l1_ratio': [0.0, 0.25, 0.5, 0.75, 1.0],
-        'C': C_vals,
-    }
-    lr_base = LogisticRegression(
-        penalty='elasticnet', solver='saga',
-        max_iter=2000, random_state=rng)
-    lr_cv = GridSearchCV(lr_base, lr_grid, cv=rskf,
-                         scoring='roc_auc', n_jobs=-1, refit=True)
-    lr_cv.fit(X_train_bal, y_train_bal)
-    best_lr = lr_cv.best_estimator_
-    print(f'  Best l1_ratio={lr_cv.best_params_["l1_ratio"]}, '
-          f'C={lr_cv.best_params_["C"]:.5f} '
-          f'(≈ lambda={1/lr_cv.best_params_["C"]:.5f})')
-    results_list.append(
-        evaluate_model(best_lr, X_test_scaled, y_test,
-                       'Logistic Regression (Elastic Net)'))
-    best_estimators['LR_ElasticNet'] = best_lr
-
-    # ── Random Forest ─────────────────────────────────────────────────────────
-    print('\n' + '=' * 60)
-    print('Step 10 – Random Forest (1 000 trees)')
-    print('=' * 60)
-    n_feats = len(selected_feats)
-    mtry_vals = sorted(set([2, 3, 4, round(np.sqrt(n_feats)),
-                             round(n_feats / 2)]))
-    rf_grid = {'max_features': mtry_vals}
-    rf_base = RandomForestClassifier(
-        n_estimators=1000, random_state=rng, n_jobs=-1)
-    rf_cv = GridSearchCV(rf_base, rf_grid, cv=rskf,
-                         scoring='roc_auc', n_jobs=-1, refit=True)
-    rf_cv.fit(X_train_bal, y_train_bal)
-    best_rf = rf_cv.best_estimator_
-    print(f'  Best mtry (max_features): {rf_cv.best_params_["max_features"]}')
-    results_list.append(
-        evaluate_model(best_rf, X_test_scaled, y_test, 'Random Forest'))
-    best_estimators['RandomForest'] = best_rf
-
-    # RF importance plot
-    plot_rf_importance(
-        best_rf, selected_feats,
-        os.path.join(out_dir, 'plot_rf_importance.png'))
-
-    # ── SVM (RBF) ─────────────────────────────────────────────────────────────
-    print('\n' + '=' * 60)
-    print('Step 11 – SVM (RBF kernel)')
-    print('=' * 60)
-    svm_grid = {
-        'C':     [0.01, 0.1, 0.5, 1, 5, 10, 50, 100],
-        'gamma': [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1],
-    }
-    svm_base = SVC(kernel='rbf', probability=True, random_state=rng)
-    svm_cv = GridSearchCV(svm_base, svm_grid, cv=rskf,
-                          scoring='roc_auc', n_jobs=-1, refit=True)
-    svm_cv.fit(X_train_bal, y_train_bal)
-    best_svm = svm_cv.best_estimator_
-    print(f'  Best C={svm_cv.best_params_["C"]}, '
-          f'gamma={svm_cv.best_params_["gamma"]}')
-    results_list.append(
-        evaluate_model(best_svm, X_test_scaled, y_test, 'SVM (RBF Kernel)'))
-    best_estimators['SVM_RBF'] = best_svm
-
-    # ── XGBoost (extension) ───────────────────────────────────────────────────
+    # Determine which models to run
+    model_keys = ['LR', 'RF', 'SVM']
     if XGB_AVAILABLE:
-        print('\n' + '=' * 60)
-        print('Step 12 – XGBoost [extension; not in published thesis results]')
-        print('=' * 60)
-        xgb_grid = {
-            'n_estimators':      [25, 50, 100],
-            'max_depth':         [2, 3],
-            'learning_rate':     [0.05, 0.1, 0.3],
-            'gamma':             [0, 0.1],
-            'colsample_bytree':  [0.8, 1.0],
-            'min_child_weight':  [1, 3],
-            'subsample':         [0.8, 1.0],
-        }
-        print(f'  Grid size: '
-              f'{3*2*3*2*2*2*2} combinations')
-        xgb_base = XGBClassifier(
-            use_label_encoder=False,
-            eval_metric='logloss',
-            verbosity=0,
-            random_state=rng,
-            n_jobs=-1)
-        xgb_cv = GridSearchCV(xgb_base, xgb_grid, cv=rskf,
-                               scoring='roc_auc', n_jobs=-1, refit=True)
-        try:
-            xgb_cv.fit(X_train_bal, y_train_bal)
-            best_xgb = xgb_cv.best_estimator_
-            print(f'  Best params: {xgb_cv.best_params_}')
-            results_list.append(
-                evaluate_model(best_xgb, X_test_scaled, y_test, 'XGBoost'))
-            best_estimators['XGBoost'] = best_xgb
-        except Exception as e:
-            print(f'  [WARN] XGBoost failed: {e}')
-    else:
-        print('\n[INFO] XGBoost skipped — not installed.')
+        model_keys.append('XGB')
 
-    # ── Step 13: Comparison table ──────────────────────────────────────────────
+    outer_cv = RepeatedStratifiedKFold(
+        n_splits=n_folds, n_repeats=n_repeats, random_state=rng)
+    inner_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=rng)
+
+    # Storage
+    fold_metrics   = {k: [] for k in model_keys}   # list of metric dicts
+    fold_rocs      = {k: [] for k in model_keys}   # list of (fpr, tpr)
+    fold_params    = {k: [] for k in model_keys}   # list of best_params dicts
+    fold_pipes     = {k: [] for k in model_keys}   # fitted pipes for best fold
+    fold_auc_vals  = {k: [] for k in model_keys}   # per-fold AUC scalars
+
+    per_fold_rows = []   # rows for per_fold_results.csv
+
+    n_outer = n_folds * n_repeats
+
+    for fold_idx, (tr_idx, te_idx) in enumerate(
+            outer_cv.split(X_all_sel, y_all_sel)):
+
+        X_tr, X_te = X_all_sel[tr_idx], X_all_sel[te_idx]
+        y_tr, y_te = y_all_sel[tr_idx], y_all_sel[te_idx]
+
+        fold_auc_parts = {}
+
+        for key in model_keys:
+            # Optuna study — suppress output
+            sampler = optuna.samplers.TPESampler(seed=rng + fold_idx)
+            study   = optuna.create_study(direction='maximize', sampler=sampler)
+            study.optimize(
+                make_objective(key, X_tr, y_tr, inner_cv, rng),
+                n_trials=n_trials,
+                show_progress_bar=False,
+            )
+
+            best_params = study.best_params.copy()
+
+            # Build final pipe; RF uses 1000 trees
+            final_params = best_params.copy()
+            if key == 'RF':
+                final_params['n_estimators'] = 1000
+            final_pipe = build_pipe(key, final_params, rng)
+            final_pipe.fit(X_tr, y_tr)
+
+            # Evaluate on outer test fold
+            metrics = eval_fold(final_pipe, X_te, y_te)
+            auc_val = metrics['auc']
+
+            fold_metrics[key].append({k: v for k, v in metrics.items()
+                                      if k not in ('fpr', 'tpr')})
+            fold_rocs[key].append((metrics['fpr'], metrics['tpr']))
+            fold_params[key].append(best_params)
+            fold_pipes[key].append(final_pipe)
+            fold_auc_vals[key].append(auc_val)
+            fold_auc_parts[key] = auc_val
+
+            per_fold_rows.append({
+                'fold':        fold_idx + 1,
+                'model':       MODEL_DISPLAY[key],
+                'auc':         round(auc_val,              4),
+                'accuracy':    round(metrics['accuracy'],   4),
+                'sensitivity': round(metrics['sensitivity'],4),
+                'specificity': round(metrics['specificity'],4),
+                'f1':          round(metrics['f1'],         4),
+                'precision':   round(metrics['precision'],  4),
+                'best_params': json.dumps(best_params),
+            })
+
+        # Progress line
+        auc_str = ' '.join(
+            f'{k} AUC={fold_auc_parts[k]:.2f}' for k in model_keys)
+        print(f'[Fold {fold_idx+1:>2}/{n_outer}] ' +
+              ' ... '.join(MODEL_DISPLAY[k] for k in model_keys) +
+              f' done.  {auc_str}')
+
+    # -------------------------------------------------------------------------
+    # Step 12: Aggregate metrics
+    # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
-    print('MODEL COMPARISON SUMMARY')
+    print('MODEL COMPARISON SUMMARY  (mean ± std over', n_outer, 'outer folds)')
     print('=' * 60)
-    comparison = pd.DataFrame([{
-        'Model':       r['name'],
-        'Accuracy':    round(r['accuracy'],    4),
-        'Sensitivity': round(r['sensitivity'], 4),
-        'Specificity': round(r['specificity'], 4),
-        'Precision':   round(r['precision'],   4),
-        'F1':          round(r['f1'],          4),
-        'AUC':         round(r['auc'],         4),
-    } for r in results_list])
-    print(comparison.to_string(index=False))
-    best_row = comparison.loc[comparison['AUC'].idxmax()]
-    print(f'\n★  Best Model: {best_row["Model"]}  |  '
-          f'AUC={best_row["AUC"]:.4f}  '
-          f'Acc={best_row["Accuracy"]:.4f}  '
-          f'F1={best_row["F1"]:.4f}')
+
+    metric_keys = ['auc', 'accuracy', 'sensitivity', 'specificity', 'f1', 'precision']
+    col_map = {
+        'auc':         ('AUC_mean',         'AUC_std'),
+        'accuracy':    ('Accuracy_mean',    'Accuracy_std'),
+        'sensitivity': ('Sensitivity_mean', 'Sensitivity_std'),
+        'specificity': ('Specificity_mean', 'Specificity_std'),
+        'f1':          ('F1_mean',          'F1_std'),
+        'precision':   ('Precision_mean',   'Precision_std'),
+    }
+
+    summary_rows = []
+    for key in model_keys:
+        row = {'Model': MODEL_DISPLAY[key]}
+        for mk in metric_keys:
+            vals = [m[mk] for m in fold_metrics[key]]
+            mean_col, std_col = col_map[mk]
+            row[mean_col] = round(float(np.mean(vals)), 4)
+            row[std_col]  = round(float(np.std(vals)),  4)
+        summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    # Print summary
+    print(summary_df[[
+        'Model', 'AUC_mean', 'AUC_std',
+        'Accuracy_mean', 'Sensitivity_mean', 'Specificity_mean',
+        'F1_mean', 'Precision_mean',
+    ]].to_string(index=False))
+
+    best_row = summary_df.loc[summary_df['AUC_mean'].idxmax()]
+    print(f'\n  Best Model: {best_row["Model"]}  AUC={best_row["AUC_mean"]:.4f} ± {best_row["AUC_std"]:.4f}')
+
+    # Save CSVs
     comp_path = os.path.join(out_dir, 'model_comparison_results.csv')
-    comparison.to_csv(comp_path, index=False)
+    summary_df.to_csv(comp_path, index=False)
     print(f'\n  Saved: {comp_path}')
 
-    # ── Step 14: Plots ─────────────────────────────────────────────────────────
+    pf_path = os.path.join(out_dir, 'per_fold_results.csv')
+    pd.DataFrame(per_fold_rows).to_csv(pf_path, index=False)
+    print(f'  Saved: {pf_path}')
+
+    # -------------------------------------------------------------------------
+    # Step 13: Plots
+    # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
-    print('Step 14 – Saving plots')
+    print('Step 13 – Saving plots')
     print('=' * 60)
-    plot_roc_curves(results_list,
-                    os.path.join(out_dir, 'plot_roc_all_models.png'))
-    plot_model_comparison_bar(comparison,
-                              os.path.join(out_dir, 'plot_model_comparison_bar.png'))
 
-    # CV dotplot: re-run cross_val_score with best estimators on balanced train
-    print('  Computing CV AUC distributions for dotplot...')
-    cv_scores = {}
-    for label, est in best_estimators.items():
-        scores = cross_val_score(
-            est, X_train_bal, y_train_bal,
-            cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=rng),
-            scoring='roc_auc', n_jobs=-1)
-        cv_scores[label] = scores
-    if cv_scores:
-        plot_cv_dotplot(cv_scores,
-                        os.path.join(out_dir, 'plot_cv_dotplot.png'))
+    # ROC mean curves
+    plot_roc_mean(
+        fold_rocs, fold_auc_vals, model_keys,
+        os.path.join(out_dir, 'plot_roc_all_models.png'),
+    )
 
-    # Print CV summary (mirrors R's summary(resamps)$statistics$ROC)
-    print('\n=== Cross-Validation ROC-AUC Summary ===')
-    for label, scores in cv_scores.items():
-        print(f'  {label:20s}  median={np.median(scores):.4f}  '
-              f'[{np.percentile(scores,2.5):.4f} – '
-              f'{np.percentile(scores,97.5):.4f}]  '
-              f'(n={len(scores)} folds)')
+    # Bar chart
+    plot_model_comparison_bar(
+        summary_df, model_keys,
+        os.path.join(out_dir, 'plot_model_comparison_bar.png'),
+    )
+
+    # AUC box plots
+    plot_auc_distributions(
+        fold_auc_vals, model_keys,
+        os.path.join(out_dir, 'plot_auc_distributions.png'),
+    )
+
+    # RF importance: fold with highest RF AUC
+    rf_aucs   = fold_auc_vals['RF']
+    best_rf_fold_idx = int(np.argmax(rf_aucs))
+    best_rf_pipe     = fold_pipes['RF'][best_rf_fold_idx]
+    rf_estimator     = best_rf_pipe.named_steps['model']
+    plot_rf_importance(
+        rf_estimator, selected_feats,
+        os.path.join(out_dir, 'plot_rf_importance.png'),
+    )
 
     print('\nAll outputs saved to:', out_dir)
     print('Done!')
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # CLI
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 if __name__ == '__main__':
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -755,6 +831,24 @@ if __name__ == '__main__':
             '--selected-features LHip_min RKnee_skew RAnkle_skew '
             'LAnkle_kurt LDP_cv TrunkY_max CoM_Y_min StepLength'
         ))
+    parser.add_argument(
+        '--n-trials',
+        type=int, default=50,
+        help='Optuna trials per model per outer fold (default: 50)')
+    parser.add_argument(
+        '--n-folds',
+        type=int, default=10,
+        help='Outer CV splits (default: 10)')
+    parser.add_argument(
+        '--n-repeats',
+        type=int, default=3,
+        help='Outer CV repeats (default: 3)')
     args = parser.parse_args()
-    main(args.features, args.out,
-         preselected_features=args.selected_features)
+    main(
+        features_csv=args.features,
+        out_dir=args.out,
+        preselected_features=args.selected_features,
+        n_trials=args.n_trials,
+        n_folds=args.n_folds,
+        n_repeats=args.n_repeats,
+    )

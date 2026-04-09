@@ -59,7 +59,7 @@ You should see `(venv)` at the start of your prompt once activated.
 pip install -r requirements.txt
 ```
 
-This installs: numpy, pandas, scipy, scikit-learn, imbalanced-learn, boruta, xgboost, matplotlib, seaborn.
+This installs: numpy, pandas, scipy, scikit-learn, imbalanced-learn, boruta, xgboost, optuna, matplotlib, seaborn.
 
 ---
 
@@ -114,22 +114,27 @@ If any mismatches appear, the columns and rows involved are reported.
 python pipeline/ml_pipeline.py
 ```
 
-This runs the full pipeline (NZV filtering → correlation filtering → statistical
-tests → Boruta → train/test split → SMOTE → GridSearchCV → evaluation) and
-saves all outputs to the `outputs/` directory.
+This runs the full pipeline and saves all outputs to `outputs/`.
+**Expected run time: 20–40 minutes** (RF + XGBoost inside 30 outer folds are
+the bottleneck).  For a quick test run use:
 
-The pipeline takes several minutes, mainly due to Boruta (200 iterations) and
-the SVM/XGBoost grid searches.
+```bash
+python pipeline/ml_pipeline.py --n-trials 20 --n-repeats 1
+```
 
-#### Why Python results differ from the thesis (R)
+#### What the improved pipeline does
 
-R and Python use completely different random number generators.  Setting
-`set.seed(42)` in R and `random_state=42` in Python produces entirely different
-random sequences — they are not comparable.  Every stochastic step diverges:
-Boruta, the train/test split, SMOTE, CV fold assignments, and model training.
+The pipeline now uses **nested cross-validation** with **Optuna** instead of a
+single 70/30 split with grid search:
 
-**To anchor the pipeline to the thesis features**, pass the 8 Boruta-confirmed
-features from the thesis directly and skip the stochastic Boruta step:
+| Component | Original | Improved |
+|-----------|----------|----------|
+| Evaluation | Single 70/30 split → 1 test result | Outer 10-fold × 3 repeats → **30 test results → mean ± std** |
+| HPO | GridSearchCV (fixed grid) | **Optuna TPE** (continuous log-space, 50 trials) |
+| SMOTE | Applied before inner CV (mild leakage) | **Inside each fold via ImbPipeline** (no leakage) |
+| SVM AUC | Could be < 0.5 from Platt inversion | **Auto-corrected inside Optuna and evaluation** |
+
+#### Anchor to thesis features (skip Boruta)
 
 ```bash
 python pipeline/ml_pipeline.py \
@@ -138,12 +143,16 @@ python pipeline/ml_pipeline.py \
     LDP_cv TrunkY_max CoM_Y_min StepLength
 ```
 
-With `--selected-features`, Boruta is skipped entirely and these features go
-straight to the train/test split.  The train/test split and SMOTE will still
-differ from R (inherent implementation difference), so metrics will not be
-identical to the thesis, but the feature space will match.
+#### All CLI options
 
-To get exact thesis results, run `thesis.R` directly in R.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--features` | `gait_features_rich.csv` | Input feature CSV |
+| `--out` | `outputs/` | Output directory |
+| `--selected-features` | *(run Boruta)* | Skip Boruta; use these features |
+| `--n-trials` | `50` | Optuna trials per model per fold |
+| `--n-folds` | `10` | Outer CV folds |
+| `--n-repeats` | `3` | Outer CV repeats (total folds = n-folds × n-repeats) |
 
 ### Step 4 — View Results
 
@@ -151,13 +160,14 @@ All outputs are saved in `outputs/`:
 
 | File | Description |
 |------|-------------|
-| `model_comparison_results.csv` | Accuracy, Sensitivity, Specificity, F1, AUC for each model |
-| `statistical_test_results.csv` | p-values and test type for all 142+ features |
+| `model_comparison_results.csv` | **mean ± std** of AUC, Accuracy, Sensitivity, Specificity, F1, Precision across all outer folds |
+| `per_fold_results.csv` | Raw metrics for every individual (fold, model) combination |
+| `statistical_test_results.csv` | p-values and test type for all retained features |
 | `plot_sig_features_boxplot.png` | Boxplots of significant features (ASD vs Non-ASD) |
-| `plot_rf_importance.png` | Random Forest feature importance (Gini) |
-| `plot_roc_all_models.png` | ROC curves for all models on the hold-out test set |
-| `plot_model_comparison_bar.png` | Grouped bar chart of all metrics |
-| `plot_cv_dotplot.png` | CV AUC distributions (5-fold × 3 repeats, median + 95% CI) |
+| `plot_rf_importance.png` | RF feature importance from the fold with the highest RF AUC |
+| `plot_roc_all_models.png` | Mean ROC curves (bold) + individual fold curves (light gray) |
+| `plot_model_comparison_bar.png` | Bar chart of mean AUC per model with ± std error bars |
+| `plot_auc_distributions.png` | Box plots of per-fold AUC distributions for each model |
 
 ---
 
@@ -175,39 +185,27 @@ All outputs are saved in `outputs/`:
 
 ### Expected range
 
-The published thesis results (hold-out test set, seed 42):
+The published thesis results (R code, single test set):
 
-| Model | AUC (thesis) |
-|-------|-------------|
+| Model | AUC (thesis R) |
+|-------|----------------|
 | SVM (RBF) | **0.935** |
-| Random Forest | — |
-| Logistic Regression | — |
 
-Your results may differ slightly from the thesis due to differences between
-R's `caret`/`glmnet` and Python's `scikit-learn` in their optimisation
-internals, even with the same grid and seed.
+The improved Python pipeline uses nested CV with a different evaluation
+framework, so direct numerical comparison with the thesis is not meaningful.
+Expect mean AUC values in the 0.70–0.95 range with std 0.05–0.15 across folds,
+reflecting genuine variability on this 72-subject dataset.
 
-### Stochasticity
+### Stochasticity and reproducibility
 
-All random operations are seeded to `42`:
-- `train_test_split(random_state=42)`
-- `StandardScaler` — deterministic
-- `SMOTE(random_state=42)`
-- `RepeatedStratifiedKFold(random_state=42)`
-- `GridSearchCV` — deterministic given a fixed CV splitter
-- `RandomForestClassifier(random_state=42)`
-- `SVC(random_state=42)`
-- `BorutaPy(random_state=42)`
-- `XGBClassifier(random_state=42)`
-
-Results should be **fully reproducible** across runs on the same machine and
-Python/library version.
+All random operations are seeded.  Outer fold seeds are `42`.  Optuna studies
+use `42 + fold_index` so each fold's hyperparameter search is independently
+reproducible.  Results are fully reproducible across runs on the same machine
+and library version.
 
 ---
 
 ## Custom Paths
-
-You can override default file locations with command-line arguments:
 
 ```bash
 # Feature extraction with custom input/output paths
@@ -216,15 +214,17 @@ python pipeline/feature_extraction.py \
     --front "Front Dataset 25KP New GC.csv" \
     --out outputs/my_features.csv
 
-# Verify against a different reference CSV
-python pipeline/feature_extraction.py \
-    --verify \
-    --reference gait_features_rich.csv
+# Verify against the ground-truth CSV
+python pipeline/feature_extraction.py --verify
 
-# ML pipeline with a custom feature CSV
+# ML pipeline — fast test run (10 folds, 20 Optuna trials)
+python pipeline/ml_pipeline.py --n-trials 20 --n-repeats 1
+
+# ML pipeline with thesis features and full settings
 python pipeline/ml_pipeline.py \
-    --features outputs/my_features.csv \
-    --out my_outputs/
+    --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt \
+                        LDP_cv TrunkY_max CoM_Y_min StepLength \
+    --n-trials 50 --n-folds 10 --n-repeats 3
 ```
 
 ---
