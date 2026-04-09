@@ -44,11 +44,16 @@ Usage
   python pipeline/ml_pipeline.py
   python pipeline/ml_pipeline.py --selected-features LHip_min RKnee_skew
   python pipeline/ml_pipeline.py --n-trials 20 --n-outer 5 --n-inner 5
+  python pipeline/ml_pipeline.py --smote
+  python pipeline/ml_pipeline.py --hpo grid
+  python pipeline/ml_pipeline.py --log run.log
+  python pipeline/ml_pipeline.py --out results/exp1
 """
 
 import argparse
 import json
 import os
+import sys
 import warnings
 
 import matplotlib
@@ -91,6 +96,32 @@ except ImportError:
     XGB_AVAILABLE = False
     print('[WARN] xgboost not installed; XGBoost model will be skipped.')
 
+try:
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    from imblearn.over_sampling import SMOTE
+    SMOTE_AVAILABLE = True
+except ImportError:
+    SMOTE_AVAILABLE = False
+
+
+# =============================================================================
+# Tee: write terminal output to stdout and a log file simultaneously
+# =============================================================================
+
+class _Tee:
+    """Wrap sys.stdout so every print goes to both the terminal and a log file."""
+    def __init__(self, stream, fpath):
+        self._stream = stream
+        self._fh     = open(fpath, 'w', encoding='utf-8')
+    def write(self, s):
+        self._stream.write(s)
+        self._fh.write(s)
+    def flush(self):
+        self._stream.flush()
+        self._fh.flush()
+    def close(self):
+        self._fh.close()
+
 
 # =============================================================================
 # Constants / display names
@@ -123,6 +154,20 @@ PARAM_GRID = {
     'SVM': {
         'model__estimator__C':     [0.1, 1.0, 10.0, 100.0, 1000.0],
         'model__estimator__gamma': ['scale', 0.01, 0.1, 1.0],
+    },
+    # RF and XGB grids used only when --hpo grid is specified.
+    # RF:  model step is CalibratedClassifierCV(RF) → model__estimator__<param>
+    # XGB: model step is XGBClassifier           → model__<param>
+    'RF': {
+        'model__estimator__n_estimators':     [200, 500],
+        'model__estimator__max_features':     [0.3, 0.5, 0.8],
+        'model__estimator__min_samples_leaf': [1, 3, 5],
+        'model__estimator__max_depth':        [5, 15, None],
+    },
+    'XGB': {
+        'model__n_estimators':  [100, 200],
+        'model__max_depth':     [3, 5, 7],
+        'model__learning_rate': [0.05, 0.1, 0.2],
     },
 }
 
@@ -317,27 +362,37 @@ def suggest_params(trial, model_key):
         raise ValueError(f'suggest_params called for {model_key} — only RF/XGB use Optuna')
 
 
-def build_pipe(model_key, params, rng=42):
+def build_pipe(model_key, params, rng=42, use_smote=False):
     """
-    Build a Pipeline with StandardScaler -> model.
-    Class imbalance is handled natively:
-      LR / SVM / RF: class_weight='balanced'
-      XGB:           scale_pos_weight = n_neg/n_pos (pass in params)
-      LDA:           uses estimated class priors by default
+    Build a Pipeline with [SMOTE →] StandardScaler → model.
+
+    Class imbalance handling:
+      use_smote=False (default):
+        LR / SVM / RF: class_weight='balanced'
+        XGB:           scale_pos_weight = n_neg/n_pos (pass in params)
+        LDA:           estimated class priors
+      use_smote=True:
+        SMOTE is prepended as a pipeline step (applied inside every CV fold).
+        class_weight is set to None for LR/SVM/RF and scale_pos_weight=1.0
+        for XGB to avoid double-correcting for class imbalance.
+
     params keys are raw model parameter names (no 'model__' prefix).
     """
+    # When SMOTE handles oversampling, native class weights must be neutral.
+    cw = None if use_smote else 'balanced'
+
     if model_key == 'LR':
         estimator = LogisticRegression(
             penalty='elasticnet', solver='saga',
             max_iter=2000, random_state=rng,
-            class_weight='balanced',
+            class_weight=cw,
             C=params.get('C', 1.0),
             l1_ratio=params.get('l1_ratio', 0.5),
         )
     elif model_key == 'RF':
         base_rf = RandomForestClassifier(
             random_state=rng, n_jobs=-1,
-            class_weight='balanced',
+            class_weight=cw,
             n_estimators=params.get('n_estimators', 200),
             max_features=params.get('max_features', 'sqrt'),
             min_samples_leaf=params.get('min_samples_leaf', 1),
@@ -349,7 +404,7 @@ def build_pipe(model_key, params, rng=42):
     elif model_key == 'SVM':
         base_svm = SVC(
             kernel='rbf', random_state=rng,
-            class_weight='balanced',
+            class_weight=cw,
             C=params.get('C', 1.0),
             gamma=params.get('gamma', 'scale'),
         )
@@ -379,24 +434,37 @@ def build_pipe(model_key, params, rng=42):
     else:
         raise ValueError(f'Unknown model_key: {model_key}')
 
-    pipe = Pipeline([
-        ('scaler', StandardScaler()),
-        ('model',  estimator),
-    ])
+    if use_smote:
+        if not SMOTE_AVAILABLE:
+            raise RuntimeError(
+                'imbalanced-learn is not installed. '
+                'Run: pip install imbalanced-learn>=0.11')
+        pipe = ImbPipeline([
+            ('smote',  SMOTE(random_state=rng)),
+            ('scaler', StandardScaler()),
+            ('model',  estimator),
+        ])
+    else:
+        pipe = Pipeline([
+            ('scaler', StandardScaler()),
+            ('model',  estimator),
+        ])
     return pipe
 
 
-def make_objective(model_key, X_tr, y_tr, inner_cv, rng):
+def make_objective(model_key, X_tr, y_tr, inner_cv, rng, use_smote=False):
     """Return an Optuna objective function for the given model and fold data."""
     # Compute class imbalance ratio once (outer training fold); used by XGB.
-    _pos_weight = (float(np.sum(y_tr == 0)) / float(np.sum(y_tr == 1))
-                   if model_key == 'XGB' and np.sum(y_tr == 1) > 0 else 1.0)
+    # When SMOTE is active, XGB sees balanced data → scale_pos_weight=1.0.
+    _pos_weight = (1.0 if use_smote else
+                   (float(np.sum(y_tr == 0)) / float(np.sum(y_tr == 1))
+                    if model_key == 'XGB' and np.sum(y_tr == 1) > 0 else 1.0))
 
     def objective(trial):
         params = suggest_params(trial, model_key)
         if model_key == 'XGB':
             params['scale_pos_weight'] = _pos_weight
-        pipe   = build_pipe(model_key, params, rng)
+        pipe   = build_pipe(model_key, params, rng, use_smote=use_smote)
         # n_jobs=1: avoids joblib pool corruption when called from Optuna's loop.
         # error_score=0.5: failed folds return 0.5 (random chance) rather than NaN.
         scores = cross_val_score(
@@ -588,7 +656,8 @@ def plot_auc_distributions(model_aucs, model_keys, out_path):
 
 def main(features_csv, out_dir,
          preselected_features=None,
-         n_trials=50, n_outer=5, n_inner=5):
+         n_trials=50, n_outer=5, n_inner=5,
+         use_smote=False, hpo='optuna'):
 
     os.makedirs(out_dir, exist_ok=True)
 
@@ -708,9 +777,13 @@ def main(features_csv, out_dir,
     # Steps 6-11: Nested stratified CV with Optuna HPO
     # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
+    _hpo_str = ('GridSearch (all)'
+                if hpo == 'grid'
+                else f'GridSearch (LR/SVM) | Optuna {n_trials} trials (RF/XGB)')
+    _smote_str = ' | SMOTE: ON' if use_smote else ''
     print(f'Steps 6–11 – Nested CV  '
           f'[outer: {n_outer}-fold | inner: {n_inner}-fold | '
-          f'GridSearch (LR/SVM) | Optuna {n_trials} trials (RF/XGB) | LDA: none]')
+          f'{_hpo_str} | LDA: none{_smote_str}]')
     print('=' * 60)
     print('  NOTE: Boruta ran on ALL data (acknowledged leakage; see FINDINGS.md)')
     print()
@@ -751,18 +824,23 @@ def main(features_csv, out_dir,
         fold_test_preds  = {}   # threshold-based predictions — used by majority-vote
         fold_auc_parts   = {}
 
+        # Models that use GridSearchCV for HPO this run.
+        # LR and SVM always use grid search.
+        # RF and XGB join them when --hpo grid is set.
+        _grid_keys = {'LR', 'SVM'} | ({'RF', 'XGB'} if hpo == 'grid' else set())
+
         for key in model_keys:
             if key == 'LDA':
                 # No HPO — Ledoit-Wolf shrinkage is fully automatic.
-                final_pipe  = build_pipe('LDA', {}, fold_idx)
+                final_pipe  = build_pipe('LDA', {}, fold_idx, use_smote)
                 final_pipe.fit(X_tr, y_tr)
                 best_params = {}
 
-            elif key in ('LR', 'SVM'):
-                # GridSearchCV — efficient for 2-parameter grids.
+            elif key in _grid_keys:
+                # GridSearchCV — covers LR/SVM always, plus RF/XGB when --hpo grid.
                 # inner_cv is stratified, n_jobs=1 avoids pool issues inside fold loop.
                 # refit=True refits the best estimator on the full outer training fold.
-                base_pipe  = build_pipe(key, {}, fold_idx)
+                base_pipe  = build_pipe(key, {}, fold_idx, use_smote)
                 gs = GridSearchCV(
                     base_pipe, PARAM_GRID[key],
                     cv=inner_cv,
@@ -773,7 +851,7 @@ def main(features_csv, out_dir,
                 gs.fit(X_tr, y_tr)
                 final_pipe  = gs.best_estimator_
                 # Strip pipeline prefixes: 'model__estimator__C' → 'C',
-                # 'model__C' → 'C'.  Works for both LR and calibrated SVM.
+                # 'model__C' → 'C'.  Works for LR, calibrated SVM/RF, and XGB.
                 best_params = {
                     k.replace('model__estimator__', '').replace('model__', ''): v
                     for k, v in gs.best_params_.items()
@@ -784,7 +862,8 @@ def main(features_csv, out_dir,
                 sampler = optuna.samplers.TPESampler(seed=fold_idx)
                 study   = optuna.create_study(direction='maximize', sampler=sampler)
                 study.optimize(
-                    make_objective(key, X_tr, y_tr, inner_cv, fold_idx),
+                    make_objective(key, X_tr, y_tr, inner_cv, fold_idx,
+                                   use_smote=use_smote),
                     n_trials=n_trials,
                     show_progress_bar=False,
                 )
@@ -798,14 +877,17 @@ def main(features_csv, out_dir,
                 else:
                     best_params = study.best_params.copy()
 
-                # Refit on full outer training fold; RF bumped to 1000 trees
+                # Refit on full outer training fold; RF bumped to 1000 trees.
+                # XGB scale_pos_weight: 1.0 when SMOTE balances training data,
+                # otherwise n_neg/n_pos from the outer training fold.
                 final_params = best_params.copy()
                 if key == 'RF':
                     final_params['n_estimators'] = 1000
                 if key == 'XGB' and np.sum(y_tr == 1) > 0:
                     final_params['scale_pos_weight'] = (
+                        1.0 if use_smote else
                         float(np.sum(y_tr == 0)) / float(np.sum(y_tr == 1)))
-                final_pipe = build_pipe(key, final_params, fold_idx)
+                final_pipe = build_pipe(key, final_params, fold_idx, use_smote)
                 final_pipe.fit(X_tr, y_tr)
 
             # Find optimal threshold from outer TRAINING set (Youden's J),
@@ -1046,7 +1128,8 @@ if __name__ == '__main__':
     parser.add_argument(
         '--n-trials',
         type=int, default=50,
-        help='Optuna trials per model per outer fold (default: 50)')
+        help='Optuna trials per model per outer fold (default: 50). '
+             'Only used when --hpo optuna (the default).')
     parser.add_argument(
         '--n-outer',
         type=int, default=5,
@@ -1055,12 +1138,51 @@ if __name__ == '__main__':
         '--n-inner',
         type=int, default=5,
         help='Number of inner CV folds for HPO (default: 5)')
+    parser.add_argument(
+        '--smote',
+        action='store_true',
+        help=(
+            'Apply SMOTE oversampling inside each inner CV fold '
+            '(requires imbalanced-learn: pip install imbalanced-learn>=0.11). '
+            'When enabled, class_weight is set to None for LR/SVM/RF and '
+            'scale_pos_weight=1.0 for XGB to avoid double-correcting for '
+            'class imbalance.'
+        ))
+    parser.add_argument(
+        '--hpo',
+        choices=['optuna', 'grid'],
+        default='optuna',
+        help=(
+            'HPO method for RF and XGB (default: optuna). '
+            '"optuna": Optuna TPE with --n-trials trials per outer fold. '
+            '"grid": GridSearchCV with a predefined coarse grid — faster but '
+            'less flexible. LR and SVM always use GridSearchCV regardless of '
+            'this setting. LDA has no HPO.'
+        ))
+    parser.add_argument(
+        '--log',
+        default=None,
+        metavar='FILE',
+        help='Write all terminal output to FILE in addition to stdout.')
     args = parser.parse_args()
-    main(
-        features_csv=args.features,
-        out_dir=args.out,
-        preselected_features=args.selected_features,
-        n_trials=args.n_trials,
-        n_outer=args.n_outer,
-        n_inner=args.n_inner,
-    )
+
+    tee = None
+    if args.log:
+        tee = _Tee(sys.stdout, args.log)
+        sys.stdout = tee
+
+    try:
+        main(
+            features_csv=args.features,
+            out_dir=args.out,
+            preselected_features=args.selected_features,
+            n_trials=args.n_trials,
+            n_outer=args.n_outer,
+            n_inner=args.n_inner,
+            use_smote=args.smote,
+            hpo=args.hpo,
+        )
+    finally:
+        if tee is not None:
+            sys.stdout = tee._stream
+            tee.close()
