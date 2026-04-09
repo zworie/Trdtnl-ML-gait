@@ -361,3 +361,87 @@ Raw model probabilities are often poorly calibrated (overconfident or underconfi
 `CalibratedClassifierCV(cv=3)` uses 3-fold internal cross-fitting: the calibrator is trained on held-out predictions, avoiding fitting on the same data used to train the base model. This is distinct from the deprecated `SVC(probability=True)` approach, which calibrates on the full training set.
 
 **Parameter routing note:** When `CalibratedClassifierCV` wraps a base estimator, sklearn `Pipeline` parameter routing prefixes HPO keys with `estimator__` rather than the model name directly. The SVM grid uses keys `model__estimator__C` and `model__estimator__gamma` to route through the calibration wrapper to the underlying `SVC`.
+
+---
+
+## 10. Results (Latest Run — 9 April 2026)
+
+### 10.1 Model comparison (mean ± std across 5 outer folds)
+
+| Model | AUC | Accuracy | Sensitivity | Specificity | F1 | Precision |
+|-------|-----|----------|-------------|-------------|-----|-----------|
+| LR (Elastic Net) | 0.785 ± 0.065 | 0.764 ± 0.056 | 0.567 ± 0.200 | 0.903 ± 0.093 | 0.646 ± 0.130 | 0.860 ± 0.127 |
+| Random Forest | 0.846 ± 0.074 | 0.752 ± 0.075 | 0.667 ± 0.236 | 0.817 ± 0.208 | 0.677 ± 0.125 | 0.785 ± 0.184 |
+| SVM (RBF) | 0.853 ± 0.116 | 0.781 ± 0.134 | 0.667 ± 0.279 | 0.858 ± 0.133 | 0.695 ± 0.195 | 0.801 ± 0.222 |
+| LDA (Ledoit-Wolf) | 0.793 ± 0.097 | 0.737 ± 0.075 | 0.533 ± 0.125 | 0.881 ± 0.071 | 0.624 ± 0.122 | 0.770 ± 0.160 |
+| XGBoost | 0.771 ± 0.146 | 0.709 ± 0.050 | 0.533 ± 0.194 | 0.833 ± 0.160 | 0.588 ± 0.101 | 0.773 ± 0.188 |
+| Soft-Vote Ensemble | 0.842 ± 0.102 | 0.751 ± 0.091 | **0.733 ± 0.271** | 0.761 ± 0.155 | 0.686 ± 0.159 | 0.700 ± 0.094 |
+| Majority-Vote Ensemble | 0.789 ± 0.147 | 0.765 ± 0.049 | 0.600 ± 0.170 | 0.881 ± 0.079 | 0.667 ± 0.116 | 0.796 ± 0.114 |
+
+Full per-fold breakdown (35 rows): `outputs/per_fold_results.csv`.
+
+**Thesis benchmark (R code, single hold-out test set):** SVM AUC = **0.935**. Direct numerical comparison is not meaningful — the nested CV framework reports lower mean AUC because it evaluates on harder, more representative splits. The thesis result is a single point estimate from one particular 70/30 split.
+
+### 10.2 Key observations
+
+- **SVM and RF are the strongest individual models** (AUC 0.85), consistent with the published thesis finding that SVM performs best.
+- **Soft-Vote Ensemble has the highest sensitivity (0.733)** — correctly identifying the most ASD subjects — at the cost of slightly lower specificity (0.761). The Youden threshold favours sensitivity for the ensemble.
+- **LR and Majority-Vote Ensemble have the highest specificity (~0.90)** — fewest false ASD alarms. LR's conservative regularisation and the majority-vote aggregation both produce higher thresholds.
+- **Fold-to-fold variance is high** (std 0.07–0.15 on AUC). This is expected on a 72-subject dataset where each test fold contains only ~14 subjects: a few misclassified subjects move all metrics substantially.
+- **XGBoost underperforms** relative to expectations (AUC 0.771); with only 8 features and 58 training subjects, the 7-param search space may overfit during HPO.
+
+---
+
+## 11. Differences from Original R Code and Thesis
+
+### 11.1 Comprehensive comparison table
+
+| Component | Original `thesis.R` | Python pipeline (`ml_pipeline.py`) | Impact |
+|-----------|--------------------|------------------------------------|--------|
+| **Evaluation framework** | Single stratified 70/30 split → one test result per model | Nested 5 × 5 stratified CV → mean ± std across 5 outer folds; all 72 subjects evaluated as test | CV gives unbiased estimate of generalisation; R result is a single-draw point estimate |
+| **Stratification** | Single stratified split (`caret::createDataPartition`) | Every outer and inner fold is stratified (`StratifiedKFold`) | Class ratio preserved throughout; more stable fold-level metrics |
+| **Model set** | LR, RF, SVM (3 models) | LR, RF, SVM, LDA, XGBoost, Soft-Vote Ensemble, Majority-Vote Ensemble (7 models) | LDA added as small-N specialist; XGBoost already in `thesis.R` but not in published results; ensembles are new |
+| **HPO — LR** | GridSearchCV (C only, smaller grid) | GridSearchCV (C × l1_ratio, 25 grid points) | More flexible regularisation search |
+| **HPO — SVM** | GridSearchCV (C × sigma/gamma) | GridSearchCV (C × gamma, 20 grid points; wider C range: 0.1–1000) | Previous Python grid (C=0.001–10) caused SVM to always select minimum C → constant-class prediction every fold. Fixed by extending grid. |
+| **HPO — RF** | GridSearchCV | Optuna TPE (50 trials, 3 continuous params) | Continuous search avoids the grid-size combinatorial explosion; TPE is more efficient than random search |
+| **HPO — XGB** | GridSearchCV | Optuna TPE (50 trials, 7 params) | 7 continuous params impractical for grid search |
+| **HPO — LDA** | N/A (not in R) | None — Ledoit-Wolf shrinkage automatic | No tuning needed; covariance regularisation is closed-form |
+| **Class imbalance** | SMOTE applied to training set after scaling (inside workflow, before inner CV in R) | `class_weight='balanced'` (LR/SVM/RF), `scale_pos_weight` (XGB), estimated priors (LDA) — no synthetic data | Eliminates synthetic-sample generation; no risk of SMOTE leakage; computationally cheaper |
+| **Probability calibration** | `SVC(probability=True)` (Platt scaling on full training set) | `CalibratedClassifierCV(cv=3, method='isotonic')` for RF; `method='sigmoid'` for SVM (calibrates on held-out fold) | Avoids calibrator fitting on the same data used to train the model; isotonic correction for RF probability bias |
+| **Decision threshold** | Fixed at 0.5 | Youden's J optimised on outer training fold per model | Adapts threshold to class distribution per fold; improves sensitivity without hardcoding |
+| **Soft-Vote Ensemble** | Not in `thesis.R` | Arithmetic mean of 5 AUC-corrected probability arrays; threshold from averaged training probs | New addition; highest sensitivity in results |
+| **Majority-Vote Ensemble** | Not in `thesis.R` | Strict majority of binary votes (3/5 required); vote count used as AUC score | New addition; highest specificity alongside LR |
+| **AUC scoring** | `pROC` with `direction="auto"` | Explicit flip: `if auc < 0.5: auc = 1 − auc; probs = 1 − probs` | Equivalent behaviour; prevents erroneous AUC < 0.5 from prediction-label misalignment |
+| **Inner CV seeding** | Single `set.seed` before entire run | `random_state=fold_idx` per inner CV | Fold HPO independently seeded; full reproducibility |
+
+### 11.2 Known limitations
+
+| Limitation | Details |
+|------------|---------|
+| **Boruta / statistical-test leakage** | Feature selection (Boruta + Shapiro/t/Wilcoxon tests) runs on all 72 subjects before the CV loop. Test-set subjects influence which features are selected. Reported CV metrics are slightly optimistic. Inherited from `thesis.R` and replicated to match published methodology. Bypass with `--selected-features`. |
+| **Small N** | 72 subjects is a small sample for 8 features and 5 models. Per-fold AUC variance (std 0.07–0.15) reflects genuine instability: a few misclassified subjects move all metrics significantly. |
+| **Fold-dependent HPO** | With only ~58 inner training subjects and a 5-fold inner CV, each inner fold has ~46 subjects — HPO signal is noisy. Optuna with 50 trials may not find the global optimum. |
+| **Angle convention difference** | The hip angle formula in the code (Shoulder–Hip–Knee) differs from the thesis (Hip–Knee only). `gait_features_rich.csv` was produced by the code, so the code formula is the operational ground truth. This affects interpretability of `LHip_min`, `RHip_skew`, etc. |
+| **N=72 vs N=74** | Two subjects from the thesis N=74 are absent from `gait_features_rich.csv`. Reason unknown. |
+
+### 11.3 R-to-Python package mapping
+
+| Component | R package | Python package |
+|-----------|-----------|----------------|
+| NZV removal | `caret::nearZeroVar` | Custom implementation in `ml_pipeline.py` |
+| Correlation filtering | `caret::findCorrelation` | Custom implementation in `ml_pipeline.py` |
+| Normality test | `shapiro.test` | `scipy.stats.shapiro` |
+| Group difference | `t.test(var.equal=FALSE)` / `wilcox.test` | `scipy.stats.ttest_ind(equal_var=False)` / `mannwhitneyu` |
+| Boruta | `Boruta` (ranger backend) | `boruta.BorutaPy` (sklearn RF backend) |
+| Train/test split | `caret::createDataPartition` | `sklearn.model_selection.StratifiedKFold` |
+| Scaling | `recipes::step_normalize` | `sklearn.preprocessing.StandardScaler` |
+| SMOTE | `themis::step_smote` | Removed; replaced by `class_weight` / `scale_pos_weight` |
+| LR | `glmnet` (coordinate descent) | `sklearn.linear_model.LogisticRegression(solver='saga')` |
+| SVM | `kernlab::ksvm` | `sklearn.svm.SVC` + `CalibratedClassifierCV` |
+| RF | `randomForest` | `sklearn.ensemble.RandomForestClassifier` + `CalibratedClassifierCV` |
+| LDA | Not in `thesis.R` | `sklearn.discriminant_analysis.LinearDiscriminantAnalysis` |
+| XGBoost | `caret` + `xgbTree` | `xgboost.XGBClassifier` |
+| HPO (grid) | `caret::train` with `trainControl` | `sklearn.model_selection.GridSearchCV` |
+| HPO (Bayesian) | Not used | `optuna.create_study` (TPE sampler) |
+| AUC | `pROC::roc` | `sklearn.metrics.roc_auc_score` |
+| ROC curve | `pROC::plot.roc` | `sklearn.metrics.roc_curve` + `matplotlib` |
