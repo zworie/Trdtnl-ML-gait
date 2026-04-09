@@ -1,7 +1,13 @@
 """
 Traditional ML Pipeline for ASD Gait Classification
 =====================================================
-Python conversion of thesis.R — nested cross-validation rewrite.
+Python conversion of thesis.R — repeated holdout evaluation.
+
+Evaluation framework (Option B — Repeated Holdout):
+  Each of N seeds produces one independent 70/30 stratified split.
+  Optuna (TPE, inner 5-fold CV) tunes hyperparameters on the training set.
+  The best model is evaluated on the held-out test set (~22 subjects).
+  Final metrics = mean ± std across N seeds.
 
 Steps:
   1.  Load gait_features_rich.csv
@@ -10,21 +16,22 @@ Steps:
   4.  Group-difference statistical tests  (Shapiro-Wilk -> t-test or Wilcoxon)
   5.  Boxplots of significant features
   6.  Boruta feature selection            (fallback: use significant features)
-  7.  Nested cross-validation (outer 10x3, inner 5-fold Optuna)
-  8.  StandardScaler + SMOTE inside ImbPipeline (no leakage)
-  9.  Optuna HPO per model per fold (TPE, 50 trials)
-  10. Evaluate on outer test fold: AUC, Accuracy, Sensitivity, Specificity, F1, Precision
-  11. Aggregate metrics: mean +/- std over 30 outer folds
-  12. Plots: ROC (mean + per-fold), bar chart, RF importance, AUC box plots
-  13. Save model_comparison_results.csv, per_fold_results.csv
+  7.  Repeated holdout: N seeds x 70/30 stratified split
+  8.  For each seed: inner 5-fold Optuna HPO on training set
+  9.  StandardScaler + SMOTE inside ImbPipeline (no leakage into test set)
+  10. Evaluate on held-out test set: AUC, Accuracy, Sensitivity, Specificity, F1, Precision
+  11. Aggregate metrics: mean +/- std over N seeds
+  12. Plots: ROC (mean + per-seed), bar chart, RF importance, AUC box plots
+  13. Save model_comparison_results.csv, per_seed_results.csv
 
 Faithfulness notes
 ------------------
 - Boruta and statistical tests are run on the FULL dataset (same as R code),
-  before the outer CV loop.  This is a data-leakage issue documented in
+  before the evaluation loop.  This is a data-leakage issue documented in
   FINDINGS.md but replicated here for reproducibility.
-- SMOTE runs inside each fold (ImbPipeline) — prevents synthetic sample leakage.
-- All random seeds are fixed; Optuna studies seeded as 42+fold_idx.
+- SMOTE runs inside each inner fold (ImbPipeline) — prevents synthetic sample
+  leakage into the held-out test set.
+- All random seeds derive from the seed index; Optuna studies seeded as seed_idx.
 - XGBoost is an extension present in thesis.R but absent from published
   thesis results.  Included here for completeness.
 
@@ -32,7 +39,7 @@ Usage
 -----
   python pipeline/ml_pipeline.py
   python pipeline/ml_pipeline.py --selected-features LHip_min RKnee_skew
-  python pipeline/ml_pipeline.py --n-trials 100 --n-folds 10 --n-repeats 3
+  python pipeline/ml_pipeline.py --n-trials 20 --n-seeds 5
 """
 
 import argparse
@@ -57,9 +64,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import make_scorer, roc_auc_score, roc_curve, confusion_matrix
 from sklearn.model_selection import (
-    RepeatedStratifiedKFold,
     StratifiedKFold,
     cross_val_score,
+    train_test_split,
 )
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -364,9 +371,9 @@ def make_objective(model_key, X_tr, y_tr, inner_cv, rng):
 # Per-fold evaluation helper
 # =============================================================================
 
-def eval_fold(final_pipe, X_te, y_te):
+def eval_holdout(final_pipe, X_te, y_te):
     """
-    Evaluate a fitted pipeline on the outer test fold.
+    Evaluate a fitted pipeline on the held-out test set.
     Returns dict of metrics and (fpr, tpr) arrays for ROC plotting.
     """
     y_prob = final_pipe.predict_proba(X_te)[:, 1]
@@ -446,7 +453,7 @@ def plot_roc_mean(fold_rocs, model_aucs, model_keys, out_path):
     ax.plot([0, 1], [0, 1], 'k--', lw=1, color='grey', zorder=0)
     ax.set_xlabel('False Positive Rate')
     ax.set_ylabel('True Positive Rate')
-    ax.set_title('ROC Curves – Mean over 30 Outer Folds')
+    ax.set_title('ROC Curves – Mean over All Seeds')
     ax.legend(loc='lower right', fontsize=8, frameon=False)
     plt.tight_layout()
     plt.savefig(out_path, dpi=130, bbox_inches='tight')
@@ -474,7 +481,7 @@ def plot_model_comparison_bar(summary_df, model_keys, out_path):
     ax.set_xticklabels(names, rotation=15, ha='right', fontsize=9)
     ax.set_ylim(0, 1.15)
     ax.set_ylabel('AUC')
-    ax.set_title('Model AUC Comparison (mean ± 1 std, 30 outer folds)')
+    ax.set_title('Model AUC Comparison (mean ± 1 std)')
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -494,7 +501,7 @@ def plot_auc_distributions(model_aucs, model_keys, out_path):
     ax.set_xticks(np.arange(1, len(names) + 1))
     ax.set_xticklabels(names, rotation=15, ha='right', fontsize=9)
     ax.set_ylabel('AUC')
-    ax.set_title('Per-fold AUC Distribution by Model (30 outer folds)')
+    ax.set_title('Per-seed AUC Distribution by Model')
     ax.axhline(0.5, color='grey', linestyle='--', lw=1)
     plt.tight_layout()
     plt.savefig(out_path, dpi=130, bbox_inches='tight')
@@ -509,10 +516,9 @@ def plot_auc_distributions(model_aucs, model_keys, out_path):
 
 def main(features_csv, out_dir,
          preselected_features=None,
-         n_trials=50, n_folds=10, n_repeats=3):
+         n_trials=50, n_seeds=30):
 
     os.makedirs(out_dir, exist_ok=True)
-    rng = 42
 
     # -------------------------------------------------------------------------
     # Step 1: Load data
@@ -602,9 +608,9 @@ def main(features_csv, out_dir,
 
         selected_feats = []
         if BORUTA_AVAILABLE:
-            rf_boruta = RandomForestClassifier(n_jobs=-1, random_state=rng)
+            rf_boruta = RandomForestClassifier(n_jobs=-1, random_state=42)
             boruta = BorutaPy(rf_boruta, n_estimators='auto',
-                              max_iter=200, random_state=rng, verbose=0)
+                              max_iter=200, random_state=42, verbose=0)
             try:
                 boruta.fit(X_all, y_all)
                 selected_feats = [feat_cols[i]
@@ -627,10 +633,10 @@ def main(features_csv, out_dir,
     df_sel = df[selected_feats + ['Class']].copy()
 
     # -------------------------------------------------------------------------
-    # Steps 6-11: Nested cross-validation with Optuna HPO
+    # Steps 6-11: Repeated holdout evaluation with Optuna HPO
     # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
-    print(f'Steps 6–11 – Nested CV  [outer: {n_folds}x{n_repeats}={n_folds*n_repeats} folds | inner: 5-fold Optuna, {n_trials} trials/model]')
+    print(f'Steps 6–11 – Repeated holdout  [{n_seeds} seeds x 70/30 split | inner: 5-fold Optuna, {n_trials} trials/model]')
     print('=' * 60)
     print('  NOTE: Boruta ran on ALL data (acknowledged leakage; see FINDINGS.md)')
     print()
@@ -643,84 +649,79 @@ def main(features_csv, out_dir,
     if XGB_AVAILABLE:
         model_keys.append('XGB')
 
-    outer_cv = RepeatedStratifiedKFold(
-        n_splits=n_folds, n_repeats=n_repeats, random_state=rng)
-    inner_cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=rng)
-
     # Storage
-    fold_metrics   = {k: [] for k in model_keys}   # list of metric dicts
-    fold_rocs      = {k: [] for k in model_keys}   # list of (fpr, tpr)
-    fold_params    = {k: [] for k in model_keys}   # list of best_params dicts
-    fold_pipes     = {k: [] for k in model_keys}   # fitted pipes for best fold
-    fold_auc_vals  = {k: [] for k in model_keys}   # per-fold AUC scalars
+    seed_metrics  = {k: [] for k in model_keys}   # list of metric dicts per seed
+    seed_rocs     = {k: [] for k in model_keys}   # list of (fpr, tpr) per seed
+    seed_auc_vals = {k: [] for k in model_keys}   # per-seed AUC scalars
+    seed_pipes    = {k: [] for k in model_keys}   # fitted pipes (for RF importance)
 
-    per_fold_rows = []   # rows for per_fold_results.csv
+    per_seed_rows = []   # rows for per_seed_results.csv
 
-    n_outer = n_folds * n_repeats
+    for seed_idx in range(n_seeds):
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X_all_sel, y_all_sel,
+            test_size=0.30,
+            stratify=y_all_sel,
+            random_state=seed_idx,
+        )
 
-    for fold_idx, (tr_idx, te_idx) in enumerate(
-            outer_cv.split(X_all_sel, y_all_sel)):
+        # Inner CV uses the same seed so each split's search is reproducible
+        inner_cv = StratifiedKFold(n_splits=5, shuffle=True,
+                                   random_state=seed_idx)
 
-        X_tr, X_te = X_all_sel[tr_idx], X_all_sel[te_idx]
-        y_tr, y_te = y_all_sel[tr_idx], y_all_sel[te_idx]
-
-        fold_auc_parts = {}
+        seed_auc_parts = {}
 
         for key in model_keys:
-            # Optuna study — suppress output
-            sampler = optuna.samplers.TPESampler(seed=rng + fold_idx)
+            sampler = optuna.samplers.TPESampler(seed=seed_idx)
             study   = optuna.create_study(direction='maximize', sampler=sampler)
             study.optimize(
-                make_objective(key, X_tr, y_tr, inner_cv, rng),
+                make_objective(key, X_tr, y_tr, inner_cv, seed_idx),
                 n_trials=n_trials,
                 show_progress_bar=False,
             )
 
             best_params = study.best_params.copy()
 
-            # Build final pipe; RF uses 1000 trees
+            # Build final pipe with best params; RF bumped to 1000 trees
             final_params = best_params.copy()
             if key == 'RF':
                 final_params['n_estimators'] = 1000
-            final_pipe = build_pipe(key, final_params, rng)
+            final_pipe = build_pipe(key, final_params, seed_idx)
             final_pipe.fit(X_tr, y_tr)
 
-            # Evaluate on outer test fold
-            metrics = eval_fold(final_pipe, X_te, y_te)
+            # Evaluate on held-out test set
+            metrics = eval_holdout(final_pipe, X_te, y_te)
             auc_val = metrics['auc']
 
-            fold_metrics[key].append({k: v for k, v in metrics.items()
+            seed_metrics[key].append({k: v for k, v in metrics.items()
                                       if k not in ('fpr', 'tpr')})
-            fold_rocs[key].append((metrics['fpr'], metrics['tpr']))
-            fold_params[key].append(best_params)
-            fold_pipes[key].append(final_pipe)
-            fold_auc_vals[key].append(auc_val)
-            fold_auc_parts[key] = auc_val
+            seed_rocs[key].append((metrics['fpr'], metrics['tpr']))
+            seed_auc_vals[key].append(auc_val)
+            seed_pipes[key].append(final_pipe)
+            seed_auc_parts[key] = auc_val
 
-            per_fold_rows.append({
-                'fold':        fold_idx + 1,
+            per_seed_rows.append({
+                'seed':        seed_idx,
                 'model':       MODEL_DISPLAY[key],
-                'auc':         round(auc_val,              4),
-                'accuracy':    round(metrics['accuracy'],   4),
-                'sensitivity': round(metrics['sensitivity'],4),
-                'specificity': round(metrics['specificity'],4),
-                'f1':          round(metrics['f1'],         4),
-                'precision':   round(metrics['precision'],  4),
+                'auc':         round(auc_val,               4),
+                'accuracy':    round(metrics['accuracy'],    4),
+                'sensitivity': round(metrics['sensitivity'], 4),
+                'specificity': round(metrics['specificity'], 4),
+                'f1':          round(metrics['f1'],          4),
+                'precision':   round(metrics['precision'],   4),
                 'best_params': json.dumps(best_params),
             })
 
         # Progress line
-        auc_str = ' '.join(
-            f'{k} AUC={fold_auc_parts[k]:.2f}' for k in model_keys)
-        print(f'[Fold {fold_idx+1:>2}/{n_outer}] ' +
-              ' ... '.join(MODEL_DISPLAY[k] for k in model_keys) +
-              f' done.  {auc_str}')
+        auc_str = '  '.join(
+            f'{k} AUC={seed_auc_parts[k]:.3f}' for k in model_keys)
+        print(f'[Seed {seed_idx+1:>2}/{n_seeds}]  {auc_str}')
 
     # -------------------------------------------------------------------------
     # Step 12: Aggregate metrics
     # -------------------------------------------------------------------------
     print('\n' + '=' * 60)
-    print('MODEL COMPARISON SUMMARY  (mean ± std over', n_outer, 'outer folds)')
+    print(f'MODEL COMPARISON SUMMARY  (mean ± std over {n_seeds} seeds)')
     print('=' * 60)
 
     metric_keys = ['auc', 'accuracy', 'sensitivity', 'specificity', 'f1', 'precision']
@@ -737,7 +738,7 @@ def main(features_csv, out_dir,
     for key in model_keys:
         row = {'Model': MODEL_DISPLAY[key]}
         for mk in metric_keys:
-            vals = [m[mk] for m in fold_metrics[key]]
+            vals = [m[mk] for m in seed_metrics[key]]
             mean_col, std_col = col_map[mk]
             row[mean_col] = round(float(np.mean(vals)), 4)
             row[std_col]  = round(float(np.std(vals)),  4)
@@ -753,16 +754,17 @@ def main(features_csv, out_dir,
     ]].to_string(index=False))
 
     best_row = summary_df.loc[summary_df['AUC_mean'].idxmax()]
-    print(f'\n  Best Model: {best_row["Model"]}  AUC={best_row["AUC_mean"]:.4f} ± {best_row["AUC_std"]:.4f}')
+    print(f'\n  Best Model: {best_row["Model"]}  '
+          f'AUC={best_row["AUC_mean"]:.4f} ± {best_row["AUC_std"]:.4f}')
 
     # Save CSVs
     comp_path = os.path.join(out_dir, 'model_comparison_results.csv')
     summary_df.to_csv(comp_path, index=False)
     print(f'\n  Saved: {comp_path}')
 
-    pf_path = os.path.join(out_dir, 'per_fold_results.csv')
-    pd.DataFrame(per_fold_rows).to_csv(pf_path, index=False)
-    print(f'  Saved: {pf_path}')
+    ps_path = os.path.join(out_dir, 'per_seed_results.csv')
+    pd.DataFrame(per_seed_rows).to_csv(ps_path, index=False)
+    print(f'  Saved: {ps_path}')
 
     # -------------------------------------------------------------------------
     # Step 13: Plots
@@ -773,7 +775,7 @@ def main(features_csv, out_dir,
 
     # ROC mean curves
     plot_roc_mean(
-        fold_rocs, fold_auc_vals, model_keys,
+        seed_rocs, seed_auc_vals, model_keys,
         os.path.join(out_dir, 'plot_roc_all_models.png'),
     )
 
@@ -785,15 +787,14 @@ def main(features_csv, out_dir,
 
     # AUC box plots
     plot_auc_distributions(
-        fold_auc_vals, model_keys,
+        seed_auc_vals, model_keys,
         os.path.join(out_dir, 'plot_auc_distributions.png'),
     )
 
-    # RF importance: fold with highest RF AUC
-    rf_aucs   = fold_auc_vals['RF']
-    best_rf_fold_idx = int(np.argmax(rf_aucs))
-    best_rf_pipe     = fold_pipes['RF'][best_rf_fold_idx]
-    rf_estimator     = best_rf_pipe.named_steps['model']
+    # RF importance: seed with highest RF AUC
+    best_rf_seed = int(np.argmax(seed_auc_vals['RF']))
+    best_rf_pipe = seed_pipes['RF'][best_rf_seed]
+    rf_estimator = best_rf_pipe.named_steps['model']
     plot_rf_importance(
         rf_estimator, selected_feats,
         os.path.join(out_dir, 'plot_rf_importance.png'),
@@ -810,7 +811,8 @@ def main(features_csv, out_dir,
 if __name__ == '__main__':
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     parser = argparse.ArgumentParser(
-        description='Traditional ML pipeline for ASD gait classification.')
+        description='Traditional ML pipeline for ASD gait classification '
+                    '— repeated holdout evaluation.')
     parser.add_argument(
         '--features',
         default=os.path.join(root, 'gait_features_rich.csv'),
@@ -834,21 +836,16 @@ if __name__ == '__main__':
     parser.add_argument(
         '--n-trials',
         type=int, default=50,
-        help='Optuna trials per model per outer fold (default: 50)')
+        help='Optuna trials per model per seed (default: 50)')
     parser.add_argument(
-        '--n-folds',
-        type=int, default=10,
-        help='Outer CV splits (default: 10)')
-    parser.add_argument(
-        '--n-repeats',
-        type=int, default=3,
-        help='Outer CV repeats (default: 3)')
+        '--n-seeds',
+        type=int, default=30,
+        help='Number of random 70/30 holdout splits (default: 30)')
     args = parser.parse_args()
     main(
         features_csv=args.features,
         out_dir=args.out,
         preselected_features=args.selected_features,
         n_trials=args.n_trials,
-        n_folds=args.n_folds,
-        n_repeats=args.n_repeats,
+        n_seeds=args.n_seeds,
     )
