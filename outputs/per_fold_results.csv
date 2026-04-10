@@ -1,0 +1,36 @@
+fold,model,auc,accuracy,sensitivity,specificity,f1,precision,best_params
+1,Logistic Regression (Elastic Net),0.7222,0.7333,0.3333,1.0,0.5,1.0,"{""C"": 0.01, ""l1_ratio"": 0.0}"
+1,Random Forest,0.8241,0.6667,0.3333,0.8889,0.4444,0.6667,"{""max_features"": 0.5939321535345923, ""min_samples_leaf"": 11, ""max_depth"": 13}"
+1,SVM (RBF Kernel),0.7222,0.5333,0.3333,0.6667,0.3636,0.4,"{""C"": 0.1, ""gamma"": ""scale""}"
+1,LDA (Ledoit-Wolf),0.7222,0.6,0.3333,0.7778,0.4,0.5,{}
+1,XGBoost,0.537,0.7333,0.3333,1.0,0.5,1.0,"{""n_estimators"": 187, ""max_depth"": 7, ""learning_rate"": 0.07768811685516967, ""subsample"": 0.7724415914984484, ""colsample_bytree"": 0.7118273996694524, ""reg_alpha"": 0.03833332156156663, ""reg_lambda"": 0.0056279320474151686}"
+1,Soft-Vote Ensemble,0.7407,0.6667,0.3333,0.8889,0.4444,0.6667,{}
+1,Majority-Vote Ensemble,0.5556,0.6667,0.3333,0.8889,0.4444,0.6667,{}
+2,Logistic Regression (Elastic Net),0.8889,0.8,0.6667,0.8889,0.7273,0.8,"{""C"": 0.01, ""l1_ratio"": 0.0}"
+2,Random Forest,0.7593,0.6667,1.0,0.4444,0.7059,0.5455,"{""max_features"": 0.47531980423231657, ""min_samples_leaf"": 11, ""max_depth"": 3}"
+2,SVM (RBF Kernel),0.9815,0.8,0.5,1.0,0.6667,1.0,"{""C"": 0.1, ""gamma"": ""scale""}"
+2,LDA (Ledoit-Wolf),0.8889,0.8,0.5,1.0,0.6667,1.0,{}
+2,XGBoost,0.7963,0.6667,0.6667,0.6667,0.6154,0.5714,"{""n_estimators"": 154, ""max_depth"": 7, ""learning_rate"": 0.010003890870040017, ""subsample"": 0.6511662863159199, ""colsample_bytree"": 0.5733779454085566, ""reg_alpha"": 0.00023407464805767542, ""reg_lambda"": 0.0005559565426712572}"
+2,Soft-Vote Ensemble,0.9074,0.7333,0.8333,0.6667,0.7143,0.625,{}
+2,Majority-Vote Ensemble,0.8796,0.8,0.6667,0.8889,0.7273,0.8,{}
+3,Logistic Regression (Elastic Net),0.8125,0.7143,0.6667,0.75,0.6667,0.6667,"{""C"": 0.01, ""l1_ratio"": 0.0}"
+3,Random Forest,0.9375,0.7857,0.8333,0.75,0.7692,0.7143,"{""max_features"": 0.49239541192780345, ""min_samples_leaf"": 1, ""max_depth"": 12}"
+3,SVM (RBF Kernel),0.8125,0.8571,1.0,0.75,0.8571,0.75,"{""C"": 0.1, ""gamma"": ""scale""}"
+3,LDA (Ledoit-Wolf),0.8125,0.7857,0.6667,0.875,0.7273,0.8,{}
+3,XGBoost,0.8333,0.7143,0.8333,0.625,0.7143,0.625,"{""n_estimators"": 159, ""max_depth"": 2, ""learning_rate"": 0.06485121677838487, ""subsample"": 0.7176611963091384, ""colsample_bytree"": 0.7101839010437445, ""reg_alpha"": 0.002095749079193946, ""reg_lambda"": 0.00065855876778994}"
+3,Soft-Vote Ensemble,0.8333,0.7143,1.0,0.5,0.75,0.6,{}
+3,Majority-Vote Ensemble,0.8646,0.7857,0.8333,0.75,0.7692,0.7143,{}
+4,Logistic Regression (Elastic Net),0.7083,0.7143,0.3333,1.0,0.5,1.0,"{""C"": 0.01, ""l1_ratio"": 0.0}"
+4,Random Forest,0.7812,0.7857,0.5,1.0,0.6667,1.0,"{""max_features"": 0.595718112317118, ""min_samples_leaf"": 11, ""max_depth"": 8}"
+4,SVM (RBF Kernel),0.75,0.7857,0.5,1.0,0.6667,1.0,"{""C"": 0.1, ""gamma"": ""scale""}"
+4,LDA (Ledoit-Wolf),0.6458,0.7143,0.5,0.875,0.6,0.75,{}
+4,XGBoost,0.7083,0.6429,0.3333,0.875,0.4444,0.6667,"{""n_estimators"": 188, ""max_depth"": 6, ""learning_rate"": 0.026896859411709814, ""subsample"": 0.7554138025988315, ""colsample_bytree"": 0.9464734771738273, ""reg_alpha"": 0.3847444428703613, ""reg_lambda"": 0.00031793712435622054}"
+4,Soft-Vote Ensemble,0.7292,0.7143,0.5,0.875,0.6,0.75,{}
+4,Majority-Vote Ensemble,0.6875,0.7857,0.5,1.0,0.6667,1.0,{}
+5,Logistic Regression (Elastic Net),0.7917,0.8571,0.8333,0.875,0.8333,0.8333,"{""C"": 0.01, ""l1_ratio"": 0.0}"
+5,Random Forest,0.9271,0.8571,0.6667,1.0,0.8,1.0,"{""max_features"": 0.970326855112309, ""min_samples_leaf"": 9, ""max_depth"": 20}"
+5,SVM (RBF Kernel),1.0,0.9286,1.0,0.875,0.9231,0.8571,"{""C"": 0.1, ""gamma"": ""scale""}"
+5,LDA (Ledoit-Wolf),0.8958,0.7857,0.6667,0.875,0.7273,0.8,{}
+5,XGBoost,0.9792,0.7857,0.5,1.0,0.6667,1.0,"{""n_estimators"": 292, ""max_depth"": 5, ""learning_rate"": 0.273383778839164, ""subsample"": 0.8574079968371824, ""colsample_bytree"": 0.8488644122986354, ""reg_alpha"": 0.0007317419987380097, ""reg_lambda"": 0.8037071262320876}"
+5,Soft-Vote Ensemble,1.0,0.9286,1.0,0.875,0.9231,0.8571,{}
+5,Majority-Vote Ensemble,0.9583,0.7857,0.6667,0.875,0.7273,0.8,{}
