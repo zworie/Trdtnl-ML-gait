@@ -110,6 +110,37 @@ EXPERIMENTS = [
         "n_trials": 100,
         "hpo": "optuna",
     },
+
+    # ── One-class / anomaly detection experiments ────────────────────────
+    #
+    # These use pipeline/oneclass_pipeline.py — learns "normal gait" from
+    # Non-ASD subjects and flags deviations as abnormal.
+    #
+    {
+        "name": "oneclass_boruta",
+        "script": "pipeline/oneclass_pipeline.py",
+        "feature_strategy": "boruta",
+    },
+    {
+        "name": "oneclass_low_cv",
+        "script": "pipeline/oneclass_pipeline.py",
+        "feature_strategy": "low-cv",
+    },
+    {
+        "name": "oneclass_significant",
+        "script": "pipeline/oneclass_pipeline.py",
+        "feature_strategy": "significant",
+    },
+    {
+        "name": "oneclass_thesis_features",
+        "script": "pipeline/oneclass_pipeline.py",
+        "selected_features": THESIS_FEATURES,
+    },
+    {
+        "name": "oneclass_all_features",
+        "script": "pipeline/oneclass_pipeline.py",
+        "feature_strategy": "all",
+    },
 ]
 
 # ─── End of experiment definitions ───────────────────────────────────────────
@@ -125,13 +156,20 @@ def build_folder_name(experiment: dict, timestamp: str) -> str:
 
 def build_command(experiment: dict, out_dir: str, log_path: str) -> list[str]:
     """Build the CLI command list for a single experiment."""
-    cmd = [sys.executable, "pipeline/ml_pipeline.py", "--out", out_dir]
+    script = experiment.get("script", "pipeline/ml_pipeline.py")
+    cmd = [sys.executable, script, "--out", out_dir]
 
     if experiment.get("smote"):
         cmd.append("--smote")
 
     if "hpo" in experiment:
         cmd.extend(["--hpo", experiment["hpo"]])
+
+    if "feature_strategy" in experiment:
+        cmd.extend(["--feature-strategy", experiment["feature_strategy"]])
+
+    if experiment.get("hybrid"):
+        cmd.append("--hybrid")
 
     if "n_outer" in experiment:
         cmd.extend(["--n-outer", str(experiment["n_outer"])])
