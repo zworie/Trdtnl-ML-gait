@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python pipeline/oneclass_pipeline.py --n-outer 3 --n-inner 3 --n-trials 5 --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt LDP_cv TrunkY_max CoM_Y_min StepLength --out outputs/test_oneclass)",
+      "Bash(./venv/Scripts/python pipeline/oneclass_pipeline.py --n-outer 3 --n-inner 3 --n-trials 5 --selected-features LHip_min RKnee_skew RAnkle_skew LAnkle_kurt LDP_cv TrunkY_max CoM_Y_min StepLength --out outputs/test_oneclass)"
+    ]
+  }
+}
