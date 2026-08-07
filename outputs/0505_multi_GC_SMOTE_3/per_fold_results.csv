@@ -1,0 +1,29 @@
+fold,model,auc,accuracy,sensitivity,specificity,f1,precision,best_params
+1,Logistic Regression (Elastic Net),0.8571,0.5556,1.0,0.2727,0.6364,0.4667,"{""C"": 0.01, ""l1_ratio"": 0.0}"
+1,Random Forest,0.7403,0.6111,0.8571,0.4545,0.6316,0.5,"{""max_features"": 0.5939321535345923, ""min_samples_leaf"": 11, ""max_depth"": 13}"
+1,SVM (RBF Kernel),0.9481,0.8333,0.8571,0.8182,0.8,0.75,"{""C"": 0.1, ""gamma"": ""scale""}"
+1,LDA (Ledoit-Wolf),0.8182,0.5556,0.8571,0.3636,0.6,0.4615,{}
+1,XGBoost,0.7662,0.8333,0.5714,1.0,0.7273,1.0,"{""n_estimators"": 187, ""max_depth"": 7, ""learning_rate"": 0.07768811685516967, ""subsample"": 0.7724415914984484, ""colsample_bytree"": 0.7118273996694524, ""reg_alpha"": 0.03833332156156663, ""reg_lambda"": 0.0056279320474151686}"
+1,Soft-Vote Ensemble,0.8571,0.7778,0.8571,0.7273,0.75,0.6667,{}
+1,Majority-Vote Ensemble,0.8506,0.6111,0.8571,0.4545,0.6316,0.5,{}
+2,Logistic Regression (Elastic Net),0.5065,0.3889,0.8571,0.0909,0.5217,0.375,"{""C"": 0.01, ""l1_ratio"": 0.0}"
+2,Random Forest,0.539,0.6111,0.2857,0.8182,0.3636,0.5,"{""max_features"": 0.47531980423231657, ""min_samples_leaf"": 11, ""max_depth"": 3}"
+2,SVM (RBF Kernel),0.7013,0.6667,0.4286,0.8182,0.5,0.6,"{""C"": 0.1, ""gamma"": ""scale""}"
+2,LDA (Ledoit-Wolf),0.5455,0.3889,0.8571,0.0909,0.5217,0.375,{}
+2,XGBoost,0.6623,0.6111,0.5714,0.6364,0.5333,0.5,"{""n_estimators"": 154, ""max_depth"": 7, ""learning_rate"": 0.010003890870040017, ""subsample"": 0.6511662863159199, ""colsample_bytree"": 0.5733779454085566, ""reg_alpha"": 0.00023407464805767542, ""reg_lambda"": 0.0005559565426712572}"
+2,Soft-Vote Ensemble,0.6234,0.5556,0.5714,0.5455,0.5,0.4444,{}
+2,Majority-Vote Ensemble,0.6039,0.5556,0.5714,0.5455,0.5,0.4444,{}
+3,Logistic Regression (Elastic Net),0.7875,0.7222,0.375,1.0,0.5455,1.0,"{""C"": 0.01, ""l1_ratio"": 0.0}"
+3,Random Forest,0.675,0.6111,0.75,0.5,0.6316,0.5455,"{""max_features"": 0.49239541192780345, ""min_samples_leaf"": 1, ""max_depth"": 12}"
+3,SVM (RBF Kernel),0.7375,0.6667,0.5,0.8,0.5714,0.6667,"{""C"": 0.1, ""gamma"": ""scale""}"
+3,LDA (Ledoit-Wolf),0.7125,0.5556,0.625,0.5,0.5556,0.5,{}
+3,XGBoost,0.6625,0.7778,0.625,0.9,0.7143,0.8333,"{""n_estimators"": 159, ""max_depth"": 2, ""learning_rate"": 0.06485121677838487, ""subsample"": 0.7176611963091384, ""colsample_bytree"": 0.7101839010437445, ""reg_alpha"": 0.002095749079193946, ""reg_lambda"": 0.00065855876778994}"
+3,Soft-Vote Ensemble,0.6875,0.6667,0.75,0.6,0.6667,0.6,{}
+3,Majority-Vote Ensemble,0.7187,0.7222,0.5,0.9,0.6154,0.8,{}
+4,Logistic Regression (Elastic Net),0.8,0.6667,0.375,0.9,0.5,0.75,"{""C"": 0.01, ""l1_ratio"": 0.0}"
+4,Random Forest,0.7125,0.6667,0.75,0.6,0.6667,0.6,"{""max_features"": 0.595718112317118, ""min_samples_leaf"": 11, ""max_depth"": 8}"
+4,SVM (RBF Kernel),0.7625,0.7778,0.75,0.8,0.75,0.75,"{""C"": 0.1, ""gamma"": ""scale""}"
+4,LDA (Ledoit-Wolf),0.775,0.6667,0.375,0.9,0.5,0.75,{}
+4,XGBoost,0.7937,0.7222,0.5,0.9,0.6154,0.8,"{""n_estimators"": 188, ""max_depth"": 6, ""learning_rate"": 0.026896859411709814, ""subsample"": 0.7554138025988315, ""colsample_bytree"": 0.9464734771738273, ""reg_alpha"": 0.3847444428703613, ""reg_lambda"": 0.00031793712435622054}"
+4,Soft-Vote Ensemble,0.8375,0.7222,0.75,0.7,0.7059,0.6667,{}
+4,Majority-Vote Ensemble,0.75,0.7778,0.625,0.9,0.7143,0.8333,{}
